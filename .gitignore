@@ -1,0 +1,69 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# Test / coverage / type check
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# IDE / editor
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs & local temp
+*.log
+*.tmp
+*.temp
+.cache/
+
+# Large local data (videos, extracted frames, pipeline outputs)
+videos/
+*.m3u8
+*.ts
+match_*_clip*/
+*_jpeg_frames/
+*.jsonl
+output_*.jsonl
+
+# Optional: keep small sample data by naming e.g. sample_output.jsonl
+# !sample_output.jsonl
