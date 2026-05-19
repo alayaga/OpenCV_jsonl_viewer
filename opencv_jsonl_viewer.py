@@ -13,19 +13,26 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+import queue
 import sys
+import threading
 import time
 import tkinter as tk
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
 try:
     import cv2
 except ImportError:
     cv2 = None
+
+try:
+    import av
+except ImportError:
+    av = None
 
 try:
     from PIL import Image, ImageTk
@@ -66,6 +73,15 @@ DEFAULT_LABEL_SCALE = 0.48
 # 自动播放时的刷新间隔，单位毫秒。30fps 约等于 33ms。
 PLAY_INTERVAL_MS = 33
 
+# 视频模式关键帧 seek 缓存。4K BGR 一帧约 24MB，不宜缓存太多。
+VIDEO_CACHE_BEFORE = 3
+VIDEO_CACHE_AFTER = 36
+VIDEO_CACHE_MAX_FRAMES = 96
+VIDEO_CACHE_KEEP_BEHIND = 6
+VIDEO_PREFETCH_AFTER = 48
+VIDEO_PREFETCH_TARGET_AHEAD = 72
+VIDEO_RESULT_POLL_MS = 30
+
 # 排错模式下的异常阈值。
 ABNORMAL_DET_THRESHOLD = 0.60
 ABNORMAL_TEAM_SCORE_THRESHOLD = 0.60
@@ -99,10 +115,116 @@ class AnnotationStore:
     summary: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class VideoKeyframeIndex:
+    camera_id: int
+    keyframe_indices: list[int] = field(default_factory=list)
+    keyframe_pts_values: list[int] = field(default_factory=list)
+
+
+class PyAvVideoFrameReader:
+    """用 PyAV 持久打开一路视频，并从最近关键帧解码到目标帧附近。"""
+
+    def __init__(
+        self,
+        playlist_path: Path,
+        annotation: CameraAnnotation,
+        keyframe_index: VideoKeyframeIndex,
+    ):
+        self.playlist_path = playlist_path
+        self.annotation = annotation
+        self.keyframe_index = keyframe_index
+        self.container: Any | None = None
+        self.stream: Any | None = None
+
+    def open(self) -> None:
+        if av is None:
+            raise RuntimeError("缺少 PyAV 依赖，请先安装：pip install av")
+
+        self.close()
+        self.container = av.open(str(self.playlist_path))
+        self.stream = self.container.streams.video[0]
+
+        try:
+            self.stream.thread_type = "AUTO"
+        except Exception:
+            try:
+                self.stream.codec_context.thread_type = "AUTO"
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self.container is not None:
+            self.container.close()
+            self.container = None
+        self.stream = None
+
+    def keyframe_start_index_for_target(self, frame_index: int) -> int:
+        pos = bisect.bisect_right(self.keyframe_index.keyframe_indices, frame_index) - 1
+        if pos < 0:
+            return 0
+        return self.keyframe_index.keyframe_indices[pos]
+
+    def seek_to_keyframe(self, keyframe_index: int) -> None:
+        if self.container is None or self.stream is None:
+            self.open()
+
+        if keyframe_index <= 0:
+            self.open()
+            return
+
+        key_pts = self.annotation.pts_values[keyframe_index]
+        try:
+            self.container.seek(key_pts, stream=self.stream, backward=True, any_frame=False)
+        except Exception:
+            self.open()
+            self.container.seek(key_pts, stream=self.stream, backward=True, any_frame=False)
+
+    def decode_cache_window(
+        self,
+        target_frame_index: int,
+        before: int,
+        after: int,
+        max_frames: int,
+    ) -> dict[int, Any]:
+        if not self.annotation.pts_values:
+            return {}
+
+        keyframe_index = self.keyframe_start_index_for_target(target_frame_index)
+        desired_start = max(keyframe_index, target_frame_index - before)
+        desired_end = min(len(self.annotation.pts_values) - 1, target_frame_index + after)
+
+        self.seek_to_keyframe(keyframe_index)
+        cache: dict[int, Any] = {}
+
+        for frame in self.container.decode(self.stream):
+            if frame.pts is None:
+                continue
+
+            pts = int(frame.pts)
+            frame_index = self.annotation.pts_to_index.get(pts)
+            if frame_index is None:
+                frame_index = nearest_index_by_pts(self.annotation, pts)
+
+            if frame_index < keyframe_index:
+                continue
+            if frame_index > desired_end:
+                break
+
+            if desired_start <= frame_index <= desired_end:
+                cache[frame_index] = frame.to_ndarray(format="bgr24")
+                if len(cache) >= max_frames:
+                    break
+
+        return cache
+
+
 def require_dependencies() -> None:
     missing = []
     if cv2 is None:
         missing.append("opencv-python")
+    if av is None:
+        missing.append("av")
     if Image is None or ImageTk is None:
         missing.append("pillow")
 
@@ -241,6 +363,48 @@ def nearest_index_by_pts(annotation: CameraAnnotation, pts: int) -> int:
     before = annotation.pts_values[position - 1]
     after = annotation.pts_values[position]
     return position - 1 if abs(pts - before) <= abs(after - pts) else position
+
+
+def build_video_keyframe_index(
+    playlist_path: Path,
+    annotation: CameraAnnotation,
+) -> VideoKeyframeIndex:
+    if av is None:
+        raise RuntimeError("缺少 PyAV 依赖，请先安装：pip install av")
+
+    keyframe_indices: list[int] = []
+    keyframe_pts_values: list[int] = []
+    seen: set[int] = set()
+
+    container = av.open(str(playlist_path))
+    try:
+        stream = container.streams.video[0]
+        stream.codec_context.skip_frame = "NONKEY"
+        for frame in container.decode(stream):
+            if frame.pts is None:
+                continue
+            pts = int(frame.pts)
+            if pts in seen:
+                continue
+            seen.add(pts)
+            index = nearest_index_by_pts(annotation, pts)
+            keyframe_indices.append(index)
+            keyframe_pts_values.append(annotation.pts_values[index])
+    finally:
+        container.close()
+
+    if not keyframe_indices:
+        keyframe_indices = [0]
+        keyframe_pts_values = [annotation.pts_values[0]]
+
+    order = sorted(range(len(keyframe_indices)), key=lambda idx: keyframe_indices[idx])
+    keyframe_indices = [keyframe_indices[idx] for idx in order]
+    keyframe_pts_values = [keyframe_pts_values[idx] for idx in order]
+    return VideoKeyframeIndex(
+        camera_id=annotation.camera_id,
+        keyframe_indices=keyframe_indices,
+        keyframe_pts_values=keyframe_pts_values,
+    )
 
 
 def player_id_text(player: dict[str, Any]) -> str:
@@ -698,11 +862,27 @@ class OpenCvJsonlViewer:
         self.store = store
         self.current_camera = initial_camera
         self.current_index = 0
-        self.capture: Any | None = None
-        self.capture_next_index = 0
         self.current_raw_frame = None
         self.current_frame_image = None
         self.canvas_image_id: int | None = None
+        self.camera_box: ttk.Combobox | None = None
+        self.choose_media_dir_button: ttk.Button | None = None
+        self.current_jsonl_path = Path(self.store.summary.get("jsonl_path", JSONL_PATH)).expanduser().resolve()
+        self.video_keyframe_indexes: dict[int, VideoKeyframeIndex] = {}
+        self.video_readers: dict[int, PyAvVideoFrameReader] = {}
+        self.video_frame_cache: dict[int, Any] = {}
+        self.video_cache_start = 0
+        self.video_cache_end = -1
+        self.video_task_token = 0
+        self.video_loading = False
+        self.video_loading_camera: int | None = None
+        self.video_loading_frame_index: int | None = None
+        self.video_prefetch_token = 0
+        self.video_prefetching = False
+        self.video_prefetch_camera: int | None = None
+        self.video_prefetch_start_index: int | None = None
+        self.video_decode_lock = threading.Lock()
+        self.video_result_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.json_offset_frames = 0
         self.is_updating_progress = False
         self.is_playing = False
@@ -745,6 +925,7 @@ class OpenCvJsonlViewer:
 
         self.build_layout()
         self.open_camera(initial_camera)
+        self.root.after(VIDEO_RESULT_POLL_MS, self.process_video_results)
 
     def build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -768,7 +949,7 @@ class OpenCvJsonlViewer:
         status_row.grid(row=5, column=0, sticky="ew", pady=(6, 0))
         status_row.columnconfigure(0, weight=1)
 
-        row1.columnconfigure(14, weight=1)
+        row1.columnconfigure(16, weight=1)
         row2.columnconfigure(16, weight=1)
         row3.columnconfigure(16, weight=1)
         progress_row.columnconfigure(1, weight=1)
@@ -776,15 +957,15 @@ class OpenCvJsonlViewer:
 
         ttk.Label(row1, text="相机").grid(row=0, column=0, padx=(0, 4))
         cameras = [str(camera_id) for camera_id in sorted(self.store.cameras)]
-        camera_box = ttk.Combobox(
+        self.camera_box = ttk.Combobox(
             row1,
             width=8,
             textvariable=self.camera_var,
             values=cameras,
             state="readonly",
         )
-        camera_box.grid(row=0, column=1, padx=4)
-        camera_box.bind("<<ComboboxSelected>>", lambda _event: self.change_camera())
+        self.camera_box.grid(row=0, column=1, padx=4)
+        self.camera_box.bind("<<ComboboxSelected>>", lambda _event: self.change_camera())
 
         ttk.Label(row1, text="模式").grid(row=0, column=2, padx=(10, 4))
         mode_box = ttk.Combobox(
@@ -809,6 +990,13 @@ class OpenCvJsonlViewer:
         ttk.Label(row1, text="PTS").grid(row=0, column=11, padx=(14, 4))
         ttk.Entry(row1, width=16, textvariable=self.pts_var).grid(row=0, column=12, padx=4)
         ttk.Button(row1, text="跳 PTS", command=self.jump_pts).grid(row=0, column=13, padx=4)
+        self.choose_media_dir_button = ttk.Button(
+            row1,
+            text="选择图片目录",
+            command=self.choose_media_dir,
+        )
+        self.choose_media_dir_button.grid(row=0, column=14, padx=(18, 4))
+        ttk.Button(row1, text="选择 JSONL", command=self.choose_jsonl).grid(row=0, column=15, padx=4)
 
         ttk.Checkbutton(row2, text="players", variable=self.show_players, command=self.render_current).grid(row=0, column=0, padx=(0, 4))
         ttk.Checkbutton(row2, text="balls", variable=self.show_balls, command=self.render_current).grid(row=0, column=1, padx=4)
@@ -969,12 +1157,463 @@ class OpenCvJsonlViewer:
         self.root.bind("<Left>", lambda _event: self.prev_frame())
         self.root.bind("<Right>", lambda _event: self.next_frame())
         self.root.bind("q", lambda _event: self.root.destroy())
+        self.update_choose_dir_button_label()
+
+    def update_choose_dir_button_label(self) -> None:
+        if self.choose_media_dir_button is None:
+            return
+        label = "选择视频目录" if self.is_video_mode() else "选择图片目录"
+        self.choose_media_dir_button.configure(text=label)
 
     def get_annotation(self) -> CameraAnnotation:
         annotation = self.store.cameras.get(self.current_camera)
         if annotation is None:
             raise KeyError(f"JSONL 中没有相机 {self.current_camera} 的数据")
         return annotation
+
+    def refresh_camera_choices(self) -> None:
+        cameras = [str(camera_id) for camera_id in sorted(self.store.cameras)]
+        if self.camera_box is not None:
+            self.camera_box.configure(values=cameras)
+
+    def choose_media_dir(self) -> None:
+        if self.is_video_mode():
+            initialdir = self.video_dir if self.video_dir.is_dir() else PROJECT_DIR
+            dialog_title = "选择视频目录"
+        else:
+            initialdir = self.frame_image_dir if self.frame_image_dir.is_dir() else PROJECT_DIR
+            dialog_title = "选择图片目录"
+
+        selected = filedialog.askdirectory(
+            title=dialog_title,
+            initialdir=str(initialdir),
+        )
+        if not selected:
+            return
+
+        self.is_playing = False
+        selected_path = Path(selected).expanduser().resolve()
+        current_pts = self.current_display_pts()
+
+        if self.is_video_mode():
+            self.cancel_video_task()
+            self.clear_video_cache()
+            self.close_video_readers()
+            self.video_keyframe_indexes.clear()
+            self.video_dir = selected_path
+            self.status_var.set(f"已切换视频目录：{self.video_dir}")
+        else:
+            self.frame_image_dir = selected_path
+            self.status_var.set(f"已切换图片目录：{self.frame_image_dir}")
+
+        self.open_camera(self.current_camera, target_pts=current_pts)
+
+    def choose_jsonl(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="选择 JSONL 文件",
+            initialdir=str(PROJECT_DIR),
+            filetypes=[
+                ("JSONL 文件", "*.jsonl"),
+                ("JSON 文件", "*.json"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not selected:
+            return
+
+        selected_path = Path(selected).expanduser().resolve()
+        current_pts = self.current_display_pts()
+        current_camera = self.current_camera
+
+        try:
+            new_store = load_annotations(selected_path)
+        except Exception as exc:
+            messagebox.showerror("读取 JSONL 失败", str(exc))
+            return
+        if not new_store.cameras:
+            messagebox.showerror("读取 JSONL 失败", "这个 JSONL 里没有可用相机数据")
+            return
+
+        self.is_playing = False
+        self.cancel_video_task()
+        self.clear_video_cache()
+        self.close_video_readers()
+        self.video_keyframe_indexes.clear()
+        self.store = new_store
+        self.current_jsonl_path = selected_path
+        self.refresh_camera_choices()
+
+        if current_camera in self.store.cameras:
+            camera_id = current_camera
+        else:
+            camera_id = sorted(self.store.cameras)[0]
+        self.current_camera = camera_id
+        self.camera_var.set(str(camera_id))
+        self.current_index = 0
+        self.current_raw_frame = None
+
+        self.status_var.set(f"已切换 JSONL：{selected_path}")
+        self.open_camera(camera_id, target_pts=current_pts)
+
+    def clear_video_cache(self) -> None:
+        self.video_frame_cache.clear()
+        self.video_cache_start = 0
+        self.video_cache_end = -1
+
+    def update_video_cache_bounds(self) -> None:
+        if self.video_frame_cache:
+            self.video_cache_start = min(self.video_frame_cache)
+            self.video_cache_end = max(self.video_frame_cache)
+        else:
+            self.video_cache_start = 0
+            self.video_cache_end = -1
+
+    def trim_video_cache(self, keep_from_index: int | None = None) -> None:
+        if keep_from_index is None:
+            keep_from_index = max(0, self.current_index - VIDEO_CACHE_KEEP_BEHIND)
+
+        for frame_index in list(self.video_frame_cache):
+            if frame_index < keep_from_index:
+                del self.video_frame_cache[frame_index]
+
+        while len(self.video_frame_cache) > VIDEO_CACHE_MAX_FRAMES:
+            oldest_index = min(self.video_frame_cache)
+            del self.video_frame_cache[oldest_index]
+
+        self.update_video_cache_bounds()
+
+    def merge_video_cache(self, cache: dict[int, Any], keep_from_index: int | None = None) -> None:
+        self.video_frame_cache.update(cache)
+        self.trim_video_cache(keep_from_index)
+
+    def close_video_readers(self) -> None:
+        for reader in self.video_readers.values():
+            reader.close()
+        self.video_readers.clear()
+
+    def close_video_reader(self, camera_id: int) -> None:
+        reader = self.video_readers.pop(camera_id, None)
+        if reader is not None:
+            reader.close()
+
+    def start_video_task(self, camera_id: int, frame_index: int) -> int:
+        self.video_task_token += 1
+        self.video_loading = True
+        self.video_loading_camera = camera_id
+        self.video_loading_frame_index = frame_index
+        self.status_var.set(f"视频模式 | 相机 {camera_id} | 正在后台解码第 {frame_index + 1} 帧...")
+        return self.video_task_token
+
+    def cancel_video_task(self) -> None:
+        self.video_task_token += 1
+        self.video_loading = False
+        self.video_loading_camera = None
+        self.video_loading_frame_index = None
+        self.cancel_video_prefetch_task()
+
+    def finish_video_task(self, token: int) -> bool:
+        if token != self.video_task_token:
+            return False
+        self.video_loading = False
+        self.video_loading_camera = None
+        self.video_loading_frame_index = None
+        return True
+
+    def is_video_task_current(self, token: int, camera_id: int) -> bool:
+        return token == self.video_task_token and camera_id == self.current_camera
+
+    def start_video_prefetch_task(self, camera_id: int, start_index: int) -> int:
+        self.video_prefetch_token += 1
+        self.video_prefetching = True
+        self.video_prefetch_camera = camera_id
+        self.video_prefetch_start_index = start_index
+        return self.video_prefetch_token
+
+    def cancel_video_prefetch_task(self) -> None:
+        self.video_prefetch_token += 1
+        self.video_prefetching = False
+        self.video_prefetch_camera = None
+        self.video_prefetch_start_index = None
+
+    def finish_video_prefetch_task(self, token: int) -> bool:
+        if token != self.video_prefetch_token:
+            return False
+        self.video_prefetching = False
+        self.video_prefetch_camera = None
+        self.video_prefetch_start_index = None
+        return True
+
+    def is_video_prefetch_current(self, token: int, camera_id: int) -> bool:
+        return token == self.video_prefetch_token and camera_id == self.current_camera
+
+    def process_video_results(self) -> None:
+        try:
+            while True:
+                result = self.video_result_queue.get_nowait()
+                kind = result.get("kind")
+                if kind == "main":
+                    self.handle_main_video_result(result)
+                elif kind == "prefetch":
+                    self.handle_prefetch_video_result(result)
+        except queue.Empty:
+            pass
+
+        if self.root.winfo_exists():
+            self.root.after(VIDEO_RESULT_POLL_MS, self.process_video_results)
+
+    def handle_main_video_result(self, result: dict[str, Any]) -> None:
+        token = int(result["token"])
+        camera_id = int(result["camera_id"])
+        frame_index = int(result["frame_index"])
+        reader = result.get("reader")
+        key_index = result.get("key_index")
+        cache = result.get("cache") or {}
+        frame = result.get("frame")
+        error = result.get("error")
+
+        if not self.is_video_task_current(token, camera_id):
+            if reader is not None and self.video_readers.get(camera_id) is not reader:
+                reader.close()
+            return
+
+        self.finish_video_task(token)
+
+        if error is not None:
+            self.status_var.set(f"视频模式解码失败：{error}")
+            return
+
+        if key_index is not None:
+            self.video_keyframe_indexes[camera_id] = key_index
+        if reader is not None:
+            self.video_readers[camera_id] = reader
+        self.merge_video_cache(cache, keep_from_index=max(0, frame_index - VIDEO_CACHE_KEEP_BEHIND))
+
+        if frame is None:
+            self.status_var.set(f"读取视频帧失败：camera={camera_id}, frame={frame_index + 1}")
+            return
+
+        self.current_index = frame_index
+        self.current_raw_frame = frame
+        self.render_frame(frame)
+        self.maybe_prefetch_video()
+
+    def handle_prefetch_video_result(self, result: dict[str, Any]) -> None:
+        token = int(result["token"])
+        camera_id = int(result["camera_id"])
+        reader = result.get("reader")
+        key_index = result.get("key_index")
+        cache = result.get("cache") or {}
+        error = result.get("error")
+
+        if not self.is_video_prefetch_current(token, camera_id):
+            if reader is not None and self.video_readers.get(camera_id) is not reader:
+                reader.close()
+            return
+
+        self.finish_video_prefetch_task(token)
+
+        if error is not None:
+            return
+
+        if key_index is not None:
+            self.video_keyframe_indexes[camera_id] = key_index
+        if reader is not None:
+            self.video_readers[camera_id] = reader
+        if cache:
+            self.merge_video_cache(cache)
+        self.maybe_prefetch_video()
+
+    def get_video_keyframe_index(self) -> VideoKeyframeIndex:
+        key_index = self.video_keyframe_indexes.get(self.current_camera)
+        if key_index is None:
+            raise RuntimeError(f"相机 {self.current_camera} 的关键帧索引尚未建立")
+        return key_index
+
+    def get_video_reader(self) -> PyAvVideoFrameReader:
+        reader = self.video_readers.get(self.current_camera)
+        if reader is not None:
+            return reader
+
+        playlist_path = self.video_dir / f"{self.current_camera}.m3u8"
+        annotation = self.get_annotation()
+        key_index = self.get_video_keyframe_index()
+        reader = PyAvVideoFrameReader(playlist_path, annotation, key_index)
+        self.video_readers[self.current_camera] = reader
+        return reader
+
+    def decode_video_cache_window(self, target_frame_index: int) -> Any | None:
+        self.clear_video_cache()
+        try:
+            reader = self.get_video_reader()
+            self.video_frame_cache = reader.decode_cache_window(
+                target_frame_index,
+                before=VIDEO_CACHE_BEFORE,
+                after=VIDEO_CACHE_AFTER,
+                max_frames=VIDEO_CACHE_MAX_FRAMES,
+            )
+        except Exception as exc:
+            self.status_var.set(f"PyAV 解码失败：{exc}")
+            return None
+
+        if not self.video_frame_cache:
+            return None
+
+        self.video_cache_start = min(self.video_frame_cache)
+        self.video_cache_end = max(self.video_frame_cache)
+        return self.video_frame_cache.get(target_frame_index)
+
+    def seek_and_render_video_async(self, frame_index: int) -> None:
+        annotation = self.get_annotation()
+        frame_index = max(0, min(frame_index, len(annotation.items) - 1))
+        camera_id = self.current_camera
+        playlist_path = self.video_dir / f"{camera_id}.m3u8"
+        if not playlist_path.is_file():
+            messagebox.showerror("视频不存在", f"找不到视频文件：{playlist_path}")
+            return
+
+        cached_frame = self.video_frame_cache.get(frame_index)
+        if cached_frame is not None:
+            self.current_index = frame_index
+            self.current_raw_frame = cached_frame
+            self.render_frame(cached_frame)
+            self.maybe_prefetch_video()
+            return
+
+        token = self.start_video_task(camera_id, frame_index)
+
+        def worker() -> None:
+            try:
+                with self.video_decode_lock:
+                    if not self.is_video_task_current(token, camera_id):
+                        return
+
+                    if camera_id not in self.video_keyframe_indexes:
+                        annotation_local = self.store.cameras[camera_id]
+                        key_index = build_video_keyframe_index(playlist_path, annotation_local)
+                    else:
+                        key_index = self.video_keyframe_indexes[camera_id]
+
+                    if not self.is_video_task_current(token, camera_id):
+                        return
+
+                    reader = self.video_readers.get(camera_id)
+                    if reader is None:
+                        annotation_local = self.store.cameras[camera_id]
+                        reader = PyAvVideoFrameReader(playlist_path, annotation_local, key_index)
+                    else:
+                        reader.keyframe_index = key_index
+                        reader.annotation = self.store.cameras[camera_id]
+
+                    cache = reader.decode_cache_window(
+                        frame_index,
+                        before=VIDEO_CACHE_BEFORE,
+                        after=VIDEO_CACHE_AFTER,
+                        max_frames=VIDEO_CACHE_MAX_FRAMES,
+                    )
+                frame = cache.get(frame_index)
+                error = None if frame is not None else "解码结果里没有目标帧"
+            except Exception as exc:
+                key_index = None
+                reader = None
+                cache = {}
+                frame = None
+                error = str(exc)
+
+            self.video_result_queue.put(
+                {
+                    "kind": "main",
+                    "token": token,
+                    "camera_id": camera_id,
+                    "frame_index": frame_index,
+                    "reader": reader,
+                    "key_index": key_index,
+                    "cache": cache,
+                    "frame": frame,
+                    "error": error,
+                }
+            )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    def maybe_prefetch_video(self) -> None:
+        if not self.is_video_mode():
+            return
+        if self.video_loading or self.video_prefetching:
+            return
+
+        annotation = self.get_annotation()
+        if not annotation.items:
+            return
+
+        if self.video_cache_end < self.current_index:
+            return
+
+        cached_ahead = self.video_cache_end - self.current_index
+        if cached_ahead >= VIDEO_PREFETCH_TARGET_AHEAD:
+            return
+
+        start_index = self.video_cache_end + 1
+        if start_index >= len(annotation.items):
+            return
+
+        camera_id = self.current_camera
+        playlist_path = self.video_dir / f"{camera_id}.m3u8"
+        if not playlist_path.is_file():
+            return
+
+        token = self.start_video_prefetch_task(camera_id, start_index)
+
+        def worker() -> None:
+            try:
+                with self.video_decode_lock:
+                    if not self.is_video_prefetch_current(token, camera_id):
+                        return
+
+                    if camera_id not in self.video_keyframe_indexes:
+                        annotation_local = self.store.cameras[camera_id]
+                        key_index = build_video_keyframe_index(playlist_path, annotation_local)
+                    else:
+                        key_index = self.video_keyframe_indexes[camera_id]
+
+                    if not self.is_video_prefetch_current(token, camera_id):
+                        return
+
+                    reader = self.video_readers.get(camera_id)
+                    if reader is None:
+                        annotation_local = self.store.cameras[camera_id]
+                        reader = PyAvVideoFrameReader(playlist_path, annotation_local, key_index)
+                    else:
+                        reader.keyframe_index = key_index
+                        reader.annotation = self.store.cameras[camera_id]
+
+                    cache = reader.decode_cache_window(
+                        start_index,
+                        before=0,
+                        after=VIDEO_PREFETCH_AFTER,
+                        max_frames=VIDEO_CACHE_MAX_FRAMES,
+                    )
+                error = None
+            except Exception as exc:
+                key_index = None
+                reader = None
+                cache = {}
+                error = str(exc)
+
+            self.video_result_queue.put(
+                {
+                    "kind": "prefetch",
+                    "token": token,
+                    "camera_id": camera_id,
+                    "reader": reader,
+                    "key_index": key_index,
+                    "cache": cache,
+                    "error": error,
+                }
+            )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
 
     def current_display_pts(self) -> int | None:
         try:
@@ -1014,13 +1653,10 @@ class OpenCvJsonlViewer:
 
     def open_camera(self, camera_id: int, target_pts: int | None = None) -> None:
         self.is_playing = False
+        self.cancel_video_task()
         if camera_id not in self.store.cameras:
             messagebox.showerror("相机不存在", f"JSONL 中没有相机 {camera_id} 的数据")
             return
-
-        self.current_camera = camera_id
-        self.camera_var.set(str(camera_id))
-        self.current_raw_frame = None
 
         if self.is_video_mode():
             playlist_path = self.video_dir / f"{camera_id}.m3u8"
@@ -1028,13 +1664,16 @@ class OpenCvJsonlViewer:
                 messagebox.showerror("视频不存在", f"找不到视频文件：{playlist_path}")
                 return
 
-            if not self.reopen_capture():
-                return
-        else:
-            if self.capture is not None:
-                self.capture.release()
-                self.capture = None
-            self.capture_next_index = 0
+        if camera_id != self.current_camera:
+            self.close_video_reader(self.current_camera)
+
+        self.current_camera = camera_id
+        self.camera_var.set(str(camera_id))
+        self.current_raw_frame = None
+        self.clear_video_cache()
+
+        if not self.is_video_mode():
+            self.close_video_reader(camera_id)
 
         annotation = self.get_annotation()
         self.update_progress_range()
@@ -1050,27 +1689,13 @@ class OpenCvJsonlViewer:
     def change_mode(self) -> None:
         self.is_playing = False
         self.current_raw_frame = None
+        self.clear_video_cache()
+        if not self.is_video_mode():
+            self.cancel_video_task()
+            self.close_video_readers()
+        self.update_choose_dir_button_label()
         current_pts = self.current_display_pts()
         self.open_camera(self.current_camera, target_pts=current_pts)
-
-    def reopen_capture(self) -> bool:
-        if self.capture is not None:
-            self.capture.release()
-            self.capture = None
-
-        playlist_path = self.video_dir / f"{self.current_camera}.m3u8"
-        self.capture = cv2.VideoCapture(str(playlist_path))
-        self.capture_next_index = 0
-
-        if not self.capture.isOpened():
-            messagebox.showerror(
-                "打开失败",
-                f"OpenCV 无法打开视频：{playlist_path}\n"
-                "如果 m3u8 无法读取，可以先确认 opencv-python 是否带 ffmpeg 支持。",
-            )
-            return False
-
-        return True
 
     def change_camera(self) -> None:
         try:
@@ -1094,7 +1719,12 @@ class OpenCvJsonlViewer:
         if not self.is_playing:
             return
 
-        self.step_frame(1)
+        next_index = self.current_index + 1
+        if self.video_loading and (not self.is_video_mode() or next_index not in self.video_frame_cache):
+            self.root.after(PLAY_INTERVAL_MS, self.play_tick)
+            return
+
+        self.seek_and_render(next_index)
         self.root.after(PLAY_INTERVAL_MS, self.play_tick)
 
     def prev_frame(self) -> None:
@@ -1233,7 +1863,10 @@ class OpenCvJsonlViewer:
         self.render_current()
 
     def step_frame(self, step: int) -> None:
-        self.seek_and_render(self.current_index + step)
+        target_index = self.current_index + step
+        if self.video_loading and (not self.is_video_mode() or target_index not in self.video_frame_cache):
+            return
+        self.seek_and_render(target_index)
 
     def seek_and_render(self, frame_index: int) -> None:
         annotation = self.get_annotation()
@@ -1242,10 +1875,15 @@ class OpenCvJsonlViewer:
 
         frame_index = max(0, min(frame_index, len(annotation.items) - 1))
 
+        if self.is_video_mode():
+            self.seek_and_render_video_async(frame_index)
+            return
+
         frame = self.read_frame_data(frame_index)
         if frame is None:
-            source_name = "视频帧" if self.is_video_mode() else "图片帧"
-            self.status_var.set(f"读取{source_name}失败：camera={self.current_camera}, frame={frame_index + 1}")
+            self.status_var.set(
+                f"读取图片帧失败：camera={self.current_camera}, frame={frame_index + 1}"
+            )
             return
 
         self.current_index = frame_index
@@ -1253,29 +1891,18 @@ class OpenCvJsonlViewer:
         self.render_frame(frame)
 
     def render_current(self) -> None:
+        if self.video_loading and self.current_raw_frame is None:
+            return
         if self.current_raw_frame is not None:
             self.render_frame(self.current_raw_frame)
         else:
             self.seek_and_render(self.current_index)
 
     def read_video_frame(self, frame_index: int) -> Any | None:
-        if self.capture is None:
-            return None
-
-        # HEVC/HLS 不能每帧都随机 seek；否则容易缺参考帧并出现灰屏。
-        # 所以向前播放时连续 read，向后/随机跳转时重新打开并从头解码到目标帧。
-        if frame_index < self.capture_next_index:
-            if not self.reopen_capture():
-                return None
-
-        frame = None
-        while self.capture_next_index <= frame_index:
-            ok, frame = self.capture.read()
-            if not ok:
-                return None
-            self.capture_next_index += 1
-
-        return frame
+        cached_frame = self.video_frame_cache.get(frame_index)
+        if cached_frame is not None:
+            return cached_frame
+        return self.decode_video_cache_window(frame_index)
 
     def read_image_frame(self, frame_index: int) -> Any | None:
         annotation = self.get_annotation()
@@ -1296,8 +1923,6 @@ class OpenCvJsonlViewer:
 
     def read_frame_data(self, frame_index: int) -> Any | None:
         if self.is_video_mode():
-            if self.capture is None:
-                return None
             return self.read_video_frame(frame_index)
         return self.read_image_frame(frame_index)
 
@@ -1351,6 +1976,12 @@ class OpenCvJsonlViewer:
                 f"team_s={self.current_team_score_threshold:.2f}, "
                 f"id_s={self.current_id_score_threshold:.2f} | "
             )
+        video_cache_status = ""
+        if self.is_video_mode():
+            prefetch_status = "预读中 | " if self.video_prefetching else ""
+            video_cache_status = (
+                f"视频缓存 {self.video_cache_start + 1}-{self.video_cache_end + 1} | {prefetch_status}"
+            )
         self.is_updating_progress = True
         self.progress_var.set(self.current_index + 1)
         self.is_updating_progress = False
@@ -1366,8 +1997,8 @@ class OpenCvJsonlViewer:
             f"原始尺寸 {frame_w}x{frame_h} -> 显示尺寸 {self.display_width}x{self.display_height} | "
             f"标签 {self.label_mode_var.get()} | "
             f"{threshold_status}"
-            f"文字 {label_scale:.2f} | "
-            f"解码位置 {self.capture_next_index}"
+            f"{video_cache_status}"
+            f"文字 {label_scale:.2f}"
         )
 
     def draw_overlay_header(
@@ -1438,37 +2069,56 @@ class OpenCvJsonlViewer:
         self.json_text.configure(state=tk.DISABLED)
 
     def close(self) -> None:
-        if self.capture is not None:
-            self.capture.release()
-            self.capture = None
+        self.cancel_video_task()
+        self.close_video_readers()
         self.root.destroy()
 
 
+def pause_before_exit(code: int = 0) -> None:
+    if sys.platform == "win32" and sys.stdin.isatty():
+        try:
+            input("\n按 Enter 键退出...")
+        except EOFError:
+            pass
+    raise SystemExit(code)
+
+
 def main() -> None:
-    args = parse_args()
     try:
+        args = parse_args()
         require_dependencies()
+
+        video_dir = args.video_dir.expanduser().resolve()
+        frame_image_dir = args.frame_image_dir.expanduser().resolve()
+        jsonl_path = args.jsonl.expanduser().resolve()
+        if not video_dir.is_dir():
+            print(f"提示：视频目录不存在，视频模式暂不可用：{video_dir}")
+        if not frame_image_dir.is_dir():
+            print(f"提示：图片帧目录不存在，图片模式暂不可用：{frame_image_dir}")
+
+        store = load_annotations(jsonl_path)
+        if args.camera not in store.cameras:
+            available = ", ".join(str(camera_id) for camera_id in sorted(store.cameras))
+            raise ValueError(f"JSONL 中没有相机 {args.camera}，可用相机：{available}")
+
+        root = tk.Tk()
+        app = OpenCvJsonlViewer(root, video_dir, frame_image_dir, store, args.camera)
+        root.protocol("WM_DELETE_WINDOW", app.close)
+        root.mainloop()
     except RuntimeError as exc:
         print(exc, file=sys.stderr)
-        raise SystemExit(1)
+        pause_before_exit(1)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"启动失败：{exc}", file=sys.stderr)
+        pause_before_exit(1)
+    except tk.TclError as exc:
+        print(f"无法创建图形界面：{exc}", file=sys.stderr)
+        pause_before_exit(1)
+    except Exception:
+        import traceback
 
-    video_dir = args.video_dir.expanduser().resolve()
-    frame_image_dir = args.frame_image_dir.expanduser().resolve()
-    jsonl_path = args.jsonl.expanduser().resolve()
-    if not video_dir.is_dir():
-        print(f"提示：视频目录不存在，视频模式暂不可用：{video_dir}")
-    if not frame_image_dir.is_dir():
-        print(f"提示：图片帧目录不存在，图片模式暂不可用：{frame_image_dir}")
-
-    store = load_annotations(jsonl_path)
-    if args.camera not in store.cameras:
-        available = ", ".join(str(camera_id) for camera_id in sorted(store.cameras))
-        raise ValueError(f"JSONL 中没有相机 {args.camera}，可用相机：{available}")
-
-    root = tk.Tk()
-    app = OpenCvJsonlViewer(root, video_dir, frame_image_dir, store, args.camera)
-    root.protocol("WM_DELETE_WINDOW", app.close)
-    root.mainloop()
+        traceback.print_exc()
+        pause_before_exit(1)
 
 
 if __name__ == "__main__":
