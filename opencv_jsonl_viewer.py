@@ -48,7 +48,7 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
 
-# 输入视频目录：里面应包含 101.m3u8 ... 124.m3u8。
+# 输入视频目录：里面应包含 101.m3u8 ... 124.m3u8 或 101.ts ... 124.ts。
 VIDEO_DIR = PROJECT_DIR / "videos" / "match_1_clip"
 
 # 2D pipeline 输出的 JSONL。
@@ -76,10 +76,10 @@ PLAY_INTERVAL_MS = 33
 # 视频模式关键帧 seek 缓存。4K BGR 一帧约 24MB，不宜缓存太多。
 VIDEO_CACHE_BEFORE = 3
 VIDEO_CACHE_AFTER = 36
-VIDEO_CACHE_MAX_FRAMES = 96
+VIDEO_CACHE_MAX_FRAMES = 240
 VIDEO_CACHE_KEEP_BEHIND = 6
-VIDEO_PREFETCH_AFTER = 48
-VIDEO_PREFETCH_TARGET_AHEAD = 72
+VIDEO_PREFETCH_AFTER = 90
+VIDEO_PREFETCH_TARGET_AHEAD = 180
 VIDEO_RESULT_POLL_MS = 30
 
 # 排错模式下的异常阈值。
@@ -175,10 +175,14 @@ class PyAvVideoFrameReader:
 
         key_pts = self.annotation.pts_values[keyframe_index]
         try:
-            self.container.seek(key_pts, stream=self.stream, backward=True, any_frame=False)
+            self.container.seek(
+                key_pts, stream=self.stream, backward=True, any_frame=False
+            )
         except Exception:
             self.open()
-            self.container.seek(key_pts, stream=self.stream, backward=True, any_frame=False)
+            self.container.seek(
+                key_pts, stream=self.stream, backward=True, any_frame=False
+            )
 
     def decode_cache_window(
         self,
@@ -192,7 +196,9 @@ class PyAvVideoFrameReader:
 
         keyframe_index = self.keyframe_start_index_for_target(target_frame_index)
         desired_start = max(keyframe_index, target_frame_index - before)
-        desired_end = min(len(self.annotation.pts_values) - 1, target_frame_index + after)
+        desired_end = min(
+            len(self.annotation.pts_values) - 1, target_frame_index + after
+        )
 
         self.seek_to_keyframe(keyframe_index)
         cache: dict[int, Any] = {}
@@ -270,8 +276,8 @@ def parse_args() -> argparse.Namespace:
 def camera_id_from_item(item: dict[str, Any]) -> int | None:
     input_url = item.get("input_url") or ""
     filename = input_url.rsplit("/", 1)[-1]
-    if filename.endswith(".m3u8"):
-        stem = filename[:-5]
+    if filename.endswith(".m3u8") or filename.endswith(".ts"):
+        stem = filename.rsplit(".", 1)[0]
         if stem.isdigit():
             return int(stem)
 
@@ -281,20 +287,27 @@ def camera_id_from_item(item: dict[str, Any]) -> int | None:
     return None
 
 
-def load_annotations(jsonl_path: Path) -> AnnotationStore:
+def load_annotations(
+    jsonl_path: Path,
+    progress_callback: Any | None = None,
+) -> AnnotationStore:
     if not jsonl_path.is_file():
         raise FileNotFoundError(f"找不到 JSONL 文件：{jsonl_path}")
 
+    file_size = jsonl_path.stat().st_size
     store = AnnotationStore()
     total_lines = 0
     bad_lines = 0
     player_count = 0
     ball_count = 0
     camera_line_counts: dict[int, int] = defaultdict(int)
+    bytes_read = 0
+    last_report = 0
 
     print(f"正在读取 JSONL：{jsonl_path}")
     with jsonl_path.open("r", encoding="utf-8") as file:
         for line in file:
+            bytes_read += len(line.encode("utf-8"))
             line = line.strip()
             if not line:
                 continue
@@ -325,13 +338,25 @@ def load_annotations(jsonl_path: Path) -> AnnotationStore:
             player_count += len(result.get("players") or [])
             ball_count += len(result.get("balls") or [])
 
+            if progress_callback and total_lines - last_report >= 500:
+                last_report = total_lines
+                pct = min(99, int(bytes_read * 100 / max(1, file_size)))
+                progress_callback(pct, total_lines, len(store.cameras))
+
+    if progress_callback:
+        progress_callback(99, total_lines, len(store.cameras))
+
     for camera_annotation in store.cameras.values():
-        order = sorted(range(len(camera_annotation.items)), key=lambda idx: camera_annotation.pts_values[idx])
+        order = sorted(
+            range(len(camera_annotation.items)),
+            key=lambda idx: camera_annotation.pts_values[idx],
+        )
         camera_annotation.items = [camera_annotation.items[idx] for idx in order]
-        camera_annotation.pts_values = [camera_annotation.pts_values[idx] for idx in order]
+        camera_annotation.pts_values = [
+            camera_annotation.pts_values[idx] for idx in order
+        ]
         camera_annotation.pts_to_index = {
-            pts: idx
-            for idx, pts in enumerate(camera_annotation.pts_values)
+            pts: idx for idx, pts in enumerate(camera_annotation.pts_values)
         }
 
     store.summary = {
@@ -344,6 +369,8 @@ def load_annotations(jsonl_path: Path) -> AnnotationStore:
         "ball_count": ball_count,
     }
     print(f"JSONL 读取完成：{total_lines} 行，{len(store.cameras)} 路相机。")
+    if progress_callback:
+        progress_callback(100, total_lines, len(store.cameras))
     return store
 
 
@@ -420,7 +447,9 @@ def label_metrics(
     thickness: int = 2,
 ) -> tuple[int, int, int]:
     font = cv2.FONT_HERSHEY_SIMPLEX
-    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    (text_width, text_height), baseline = cv2.getTextSize(
+        text, font, font_scale, thickness
+    )
     rect_width = text_width + 6
     rect_height = text_height + 2 * baseline + 6
     baseline_offset = text_height + baseline + 4
@@ -435,7 +464,9 @@ def label_rect_from_top_left(
     font_scale: float,
     thickness: int,
 ) -> tuple[int, int, tuple[int, int, int, int]]:
-    rect_width, rect_height, baseline_offset = label_metrics(text, font_scale, thickness)
+    rect_width, rect_height, baseline_offset = label_metrics(
+        text, font_scale, thickness
+    )
     max_left = max(0, frame.shape[1] - rect_width)
     max_top = max(0, frame.shape[0] - rect_height)
     clamped_left = max(0, min(int(round(left)), max_left))
@@ -476,7 +507,9 @@ def draw_label(
         (0, 0, 0),
         -1,
     )
-    cv2.putText(frame, text, (x + 3, y), font, font_scale, color, thickness, cv2.LINE_AA)
+    cv2.putText(
+        frame, text, (x + 3, y), font, font_scale, color, thickness, cv2.LINE_AA
+    )
     return rect
 
 
@@ -489,14 +522,18 @@ def text_rect(
     thickness: int,
 ) -> tuple[int, int, int, int]:
     _, _, baseline_offset = label_metrics(text, font_scale, thickness)
-    return label_rect_from_top_left(frame, text, x, y - baseline_offset, font_scale, thickness)[2]
+    return label_rect_from_top_left(
+        frame, text, x, y - baseline_offset, font_scale, thickness
+    )[2]
 
 
 def rects_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
     return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
 
 
-def expanded_rect(rect: tuple[int, int, int, int], padding: int) -> tuple[int, int, int, int]:
+def expanded_rect(
+    rect: tuple[int, int, int, int], padding: int
+) -> tuple[int, int, int, int]:
     return (
         rect[0] - padding,
         rect[1] - padding,
@@ -616,7 +653,9 @@ def find_label_position(
     best_position: tuple[int, int] | None = None
     best_score: tuple[int, int, int] | None = None
     for left, top in candidates:
-        label_x, label_y, rect = label_rect_from_top_left(frame, text, left, top, font_scale, thickness)
+        label_x, label_y, rect = label_rect_from_top_left(
+            frame, text, left, top, font_scale, thickness
+        )
         padded_rect = expanded_rect(rect, gap)
         overlap_score = sum(
             overlap_area(padded_rect, expanded_rect(occupied, gap))
@@ -778,7 +817,9 @@ def draw_detections(
                     label_scale,
                     label_thickness,
                 )
-                rect = text_rect(frame, label, label_x, label_y, label_scale, label_thickness)
+                rect = text_rect(
+                    frame, label, label_x, label_y, label_scale, label_thickness
+                )
                 draw_leader_line(
                     frame,
                     (x1, y1, x2, y2),
@@ -817,7 +858,9 @@ def draw_detections(
                 int(round(float(bbox[2]) * scale_x)),
                 int(round(float(bbox[3]) * scale_y)),
             ]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), BALL_COLOR_BGR, max(2, box_thickness + 1))
+            cv2.rectangle(
+                frame, (x1, y1), (x2, y2), BALL_COLOR_BGR, max(2, box_thickness + 1)
+            )
             label = f"ball {float(ball.get('score', 0)):.2f}"
             label_x, label_y = find_label_position(
                 frame,
@@ -827,7 +870,9 @@ def draw_detections(
                 label_scale,
                 label_thickness,
             )
-            rect = text_rect(frame, label, label_x, label_y, label_scale, label_thickness)
+            rect = text_rect(
+                frame, label, label_x, label_y, label_scale, label_thickness
+            )
             draw_leader_line(
                 frame,
                 (x1, y1, x2, y2),
@@ -867,7 +912,13 @@ class OpenCvJsonlViewer:
         self.canvas_image_id: int | None = None
         self.camera_box: ttk.Combobox | None = None
         self.choose_media_dir_button: ttk.Button | None = None
-        self.current_jsonl_path = Path(self.store.summary.get("jsonl_path", JSONL_PATH)).expanduser().resolve()
+        self.current_jsonl_path = (
+            Path(self.store.summary.get("jsonl_path", JSONL_PATH))
+            .expanduser()
+            .resolve()
+        )
+        self.jsonl_load_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.jsonl_loading = False
         self.video_keyframe_indexes: dict[int, VideoKeyframeIndex] = {}
         self.video_readers: dict[int, PyAvVideoFrameReader] = {}
         self.video_frame_cache: dict[int, Any] = {}
@@ -883,6 +934,9 @@ class OpenCvJsonlViewer:
         self.video_prefetch_start_index: int | None = None
         self.video_decode_lock = threading.Lock()
         self.video_result_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.video_cache_max_frames = VIDEO_CACHE_MAX_FRAMES
+        self.video_prefetch_after = VIDEO_PREFETCH_AFTER
+        self.video_prefetch_target_ahead = VIDEO_PREFETCH_TARGET_AHEAD
         self.json_offset_frames = 0
         self.is_updating_progress = False
         self.is_playing = False
@@ -897,6 +951,8 @@ class OpenCvJsonlViewer:
         self.progress_var = tk.DoubleVar(value=1)
         self.json_offset_var = tk.StringVar(value="0")
         self.status_var = tk.StringVar(value="")
+        self.cache_status_var = tk.StringVar(value="缓冲：未启用")
+        self.cache_target_var = tk.StringVar(value=str(VIDEO_PREFETCH_TARGET_AHEAD))
         self.display_width_var = tk.StringVar(value=str(DISPLAY_WIDTH))
         self.display_height_var = tk.StringVar(value=str(DISPLAY_HEIGHT))
         self.video_scale_var = tk.DoubleVar(value=DEFAULT_VIDEO_SCALE)
@@ -916,16 +972,26 @@ class OpenCvJsonlViewer:
         self.current_team_score_threshold = ABNORMAL_TEAM_SCORE_THRESHOLD
         self.current_id_score_threshold = ABNORMAL_ID_SCORE_THRESHOLD
         self.det_threshold_var = tk.StringVar(value=f"{ABNORMAL_DET_THRESHOLD:.2f}")
-        self.team_score_threshold_var = tk.StringVar(value=f"{ABNORMAL_TEAM_SCORE_THRESHOLD:.2f}")
-        self.id_score_threshold_var = tk.StringVar(value=f"{ABNORMAL_ID_SCORE_THRESHOLD:.2f}")
+        self.team_score_threshold_var = tk.StringVar(
+            value=f"{ABNORMAL_TEAM_SCORE_THRESHOLD:.2f}"
+        )
+        self.id_score_threshold_var = tk.StringVar(
+            value=f"{ABNORMAL_ID_SCORE_THRESHOLD:.2f}"
+        )
 
         self.root.title("OpenCV JSONL 检测结果查看器")
         self.root.geometry("1500x900")
         self.root.minsize(1100, 700)
 
         self.build_layout()
-        self.open_camera(initial_camera)
+        if self.store.cameras:
+            self.open_camera(initial_camera)
+        else:
+            self.status_var.set(
+                "尚未加载数据，请点击「加载预设资源」或手动选择 JSONL 文件"
+            )
         self.root.after(VIDEO_RESULT_POLL_MS, self.process_video_results)
+        self.root.after(100, self.process_jsonl_load_results)
 
     def build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -949,7 +1015,7 @@ class OpenCvJsonlViewer:
         status_row.grid(row=5, column=0, sticky="ew", pady=(6, 0))
         status_row.columnconfigure(0, weight=1)
 
-        row1.columnconfigure(16, weight=1)
+        row1.columnconfigure(17, weight=1)
         row2.columnconfigure(16, weight=1)
         row3.columnconfigure(16, weight=1)
         progress_row.columnconfigure(1, weight=1)
@@ -965,7 +1031,9 @@ class OpenCvJsonlViewer:
             state="readonly",
         )
         self.camera_box.grid(row=0, column=1, padx=4)
-        self.camera_box.bind("<<ComboboxSelected>>", lambda _event: self.change_camera())
+        self.camera_box.bind(
+            "<<ComboboxSelected>>", lambda _event: self.change_camera()
+        )
 
         ttk.Label(row1, text="模式").grid(row=0, column=2, padx=(10, 4))
         mode_box = ttk.Combobox(
@@ -978,29 +1046,62 @@ class OpenCvJsonlViewer:
         mode_box.grid(row=0, column=3, padx=4)
         mode_box.bind("<<ComboboxSelected>>", lambda _event: self.change_mode())
 
-        ttk.Button(row1, text="播放/暂停", command=self.toggle_play).grid(row=0, column=4, padx=(14, 4))
-        ttk.Button(row1, text="上一帧", command=self.prev_frame).grid(row=0, column=5, padx=4)
-        ttk.Button(row1, text="第一帧", command=self.first_frame).grid(row=0, column=6, padx=4)
-        ttk.Button(row1, text="下一帧", command=self.next_frame).grid(row=0, column=7, padx=4)
+        ttk.Button(row1, text="播放/暂停", command=self.toggle_play).grid(
+            row=0, column=4, padx=(14, 4)
+        )
+        ttk.Button(row1, text="上一帧", command=self.prev_frame).grid(
+            row=0, column=5, padx=4
+        )
+        ttk.Button(row1, text="第一帧", command=self.first_frame).grid(
+            row=0, column=6, padx=4
+        )
+        ttk.Button(row1, text="下一帧", command=self.next_frame).grid(
+            row=0, column=7, padx=4
+        )
 
         ttk.Label(row1, text="帧序号").grid(row=0, column=8, padx=(14, 4))
-        ttk.Entry(row1, width=10, textvariable=self.frame_var).grid(row=0, column=9, padx=4)
-        ttk.Button(row1, text="跳帧", command=self.jump_frame).grid(row=0, column=10, padx=4)
+        ttk.Entry(row1, width=10, textvariable=self.frame_var).grid(
+            row=0, column=9, padx=4
+        )
+        ttk.Button(row1, text="跳帧", command=self.jump_frame).grid(
+            row=0, column=10, padx=4
+        )
 
         ttk.Label(row1, text="PTS").grid(row=0, column=11, padx=(14, 4))
-        ttk.Entry(row1, width=16, textvariable=self.pts_var).grid(row=0, column=12, padx=4)
-        ttk.Button(row1, text="跳 PTS", command=self.jump_pts).grid(row=0, column=13, padx=4)
+        ttk.Entry(row1, width=16, textvariable=self.pts_var).grid(
+            row=0, column=12, padx=4
+        )
+        ttk.Button(row1, text="跳 PTS", command=self.jump_pts).grid(
+            row=0, column=13, padx=4
+        )
         self.choose_media_dir_button = ttk.Button(
             row1,
             text="选择图片目录",
             command=self.choose_media_dir,
         )
         self.choose_media_dir_button.grid(row=0, column=14, padx=(18, 4))
-        ttk.Button(row1, text="选择 JSONL", command=self.choose_jsonl).grid(row=0, column=15, padx=4)
+        ttk.Button(row1, text="选择 JSONL", command=self.choose_jsonl).grid(
+            row=0, column=15, padx=4
+        )
+        ttk.Button(row1, text="加载预设资源", command=self.load_preset_resources).grid(
+            row=0, column=16, padx=4
+        )
 
-        ttk.Checkbutton(row2, text="players", variable=self.show_players, command=self.render_current).grid(row=0, column=0, padx=(0, 4))
-        ttk.Checkbutton(row2, text="balls", variable=self.show_balls, command=self.render_current).grid(row=0, column=1, padx=4)
-        ttk.Checkbutton(row2, text="keypoints", variable=self.show_keypoints, command=self.render_current).grid(row=0, column=2, padx=4)
+        ttk.Checkbutton(
+            row2,
+            text="players",
+            variable=self.show_players,
+            command=self.render_current,
+        ).grid(row=0, column=0, padx=(0, 4))
+        ttk.Checkbutton(
+            row2, text="balls", variable=self.show_balls, command=self.render_current
+        ).grid(row=0, column=1, padx=4)
+        ttk.Checkbutton(
+            row2,
+            text="keypoints",
+            variable=self.show_keypoints,
+            command=self.render_current,
+        ).grid(row=0, column=2, padx=4)
 
         ttk.Label(row2, text="视频大小").grid(row=0, column=3, padx=(14, 4))
         video_scale = ttk.Scale(
@@ -1012,13 +1113,21 @@ class OpenCvJsonlViewer:
             command=self.on_video_scale_change,
         )
         video_scale.grid(row=0, column=4, padx=4, sticky="ew")
-        ttk.Label(row2, textvariable=self.video_scale_text_var, width=5).grid(row=0, column=5, padx=(0, 4))
+        ttk.Label(row2, textvariable=self.video_scale_text_var, width=5).grid(
+            row=0, column=5, padx=(0, 4)
+        )
 
         ttk.Label(row2, text="显示宽").grid(row=0, column=6, padx=(10, 4))
-        ttk.Entry(row2, width=8, textvariable=self.display_width_var).grid(row=0, column=7, padx=4)
+        ttk.Entry(row2, width=8, textvariable=self.display_width_var).grid(
+            row=0, column=7, padx=4
+        )
         ttk.Label(row2, text="显示高").grid(row=0, column=8, padx=4)
-        ttk.Entry(row2, width=8, textvariable=self.display_height_var).grid(row=0, column=9, padx=4)
-        ttk.Button(row2, text="应用显示", command=self.apply_display_settings).grid(row=0, column=10, padx=4)
+        ttk.Entry(row2, width=8, textvariable=self.display_height_var).grid(
+            row=0, column=9, padx=4
+        )
+        ttk.Button(row2, text="应用显示", command=self.apply_display_settings).grid(
+            row=0, column=10, padx=4
+        )
 
         ttk.Label(row2, text="文字大小").grid(row=0, column=11, padx=(14, 4))
         label_scale = ttk.Scale(
@@ -1030,7 +1139,9 @@ class OpenCvJsonlViewer:
             command=self.on_label_scale_change,
         )
         label_scale.grid(row=0, column=12, padx=4, sticky="ew")
-        ttk.Label(row2, textvariable=self.label_scale_text_var, width=5).grid(row=0, column=13, padx=(0, 4))
+        ttk.Label(row2, textvariable=self.label_scale_text_var, width=5).grid(
+            row=0, column=13, padx=(0, 4)
+        )
 
         ttk.Label(row3, text="标签模式").grid(row=0, column=0, padx=(0, 4))
         label_mode_box = ttk.Combobox(
@@ -1041,7 +1152,9 @@ class OpenCvJsonlViewer:
             state="readonly",
         )
         label_mode_box.grid(row=0, column=1, padx=4)
-        label_mode_box.bind("<<ComboboxSelected>>", lambda _event: self.on_label_mode_change())
+        label_mode_box.bind(
+            "<<ComboboxSelected>>", lambda _event: self.on_label_mode_change()
+        )
 
         self.label_option_widgets: list[ttk.Checkbutton] = []
         option_specs = [
@@ -1062,13 +1175,21 @@ class OpenCvJsonlViewer:
             self.label_option_widgets.append(checkbox)
 
         ttk.Label(row3, text="JSON偏移").grid(row=0, column=8, padx=(18, 4))
-        ttk.Button(row3, text="←", width=3, command=lambda: self.step_json_offset(-1)).grid(row=0, column=9, padx=2)
+        ttk.Button(
+            row3, text="←", width=3, command=lambda: self.step_json_offset(-1)
+        ).grid(row=0, column=9, padx=2)
         json_offset_entry = ttk.Entry(row3, width=7, textvariable=self.json_offset_var)
         json_offset_entry.grid(row=0, column=10, padx=2)
         json_offset_entry.bind("<Return>", lambda _event: self.apply_json_offset())
-        ttk.Button(row3, text="→", width=3, command=lambda: self.step_json_offset(1)).grid(row=0, column=11, padx=2)
-        ttk.Button(row3, text="应用", command=self.apply_json_offset).grid(row=0, column=12, padx=(6, 2))
-        ttk.Button(row3, text="归零", command=self.reset_json_offset).grid(row=0, column=13, padx=2)
+        ttk.Button(
+            row3, text="→", width=3, command=lambda: self.step_json_offset(1)
+        ).grid(row=0, column=11, padx=2)
+        ttk.Button(row3, text="应用", command=self.apply_json_offset).grid(
+            row=0, column=12, padx=(6, 2)
+        )
+        ttk.Button(row3, text="归零", command=self.reset_json_offset).grid(
+            row=0, column=13, padx=2
+        )
 
         ttk.Label(progress_row, text="播放进度").grid(row=0, column=0, padx=(0, 8))
         self.progress_scale = ttk.Scale(
@@ -1080,24 +1201,53 @@ class OpenCvJsonlViewer:
             command=self.on_progress_drag,
         )
         self.progress_scale.grid(row=0, column=1, sticky="ew", padx=4)
-        self.progress_scale.bind("<ButtonRelease-1>", lambda _event: self.apply_progress_seek())
+        self.progress_scale.bind(
+            "<ButtonRelease-1>", lambda _event: self.apply_progress_seek()
+        )
         self.progress_scale.bind("<Return>", lambda _event: self.apply_progress_seek())
 
-        ttk.Label(self.threshold_row, text="异常阈值").grid(row=0, column=0, padx=(0, 8))
+        ttk.Label(self.threshold_row, text="异常阈值").grid(
+            row=0, column=0, padx=(0, 8)
+        )
         ttk.Label(self.threshold_row, text="det").grid(row=0, column=1, padx=(0, 4))
-        det_entry = ttk.Entry(self.threshold_row, width=7, textvariable=self.det_threshold_var)
+        det_entry = ttk.Entry(
+            self.threshold_row, width=7, textvariable=self.det_threshold_var
+        )
         det_entry.grid(row=0, column=2, padx=(0, 10))
         ttk.Label(self.threshold_row, text="team_s").grid(row=0, column=3, padx=(0, 4))
-        team_score_entry = ttk.Entry(self.threshold_row, width=7, textvariable=self.team_score_threshold_var)
+        team_score_entry = ttk.Entry(
+            self.threshold_row, width=7, textvariable=self.team_score_threshold_var
+        )
         team_score_entry.grid(row=0, column=4, padx=(0, 10))
         ttk.Label(self.threshold_row, text="id_s").grid(row=0, column=5, padx=(0, 4))
-        id_score_entry = ttk.Entry(self.threshold_row, width=7, textvariable=self.id_score_threshold_var)
+        id_score_entry = ttk.Entry(
+            self.threshold_row, width=7, textvariable=self.id_score_threshold_var
+        )
         id_score_entry.grid(row=0, column=6, padx=(0, 10))
-        ttk.Button(self.threshold_row, text="应用阈值", command=self.apply_threshold_settings).grid(row=0, column=7, padx=4)
+        ttk.Button(
+            self.threshold_row, text="应用阈值", command=self.apply_threshold_settings
+        ).grid(row=0, column=7, padx=4)
         for entry in [det_entry, team_score_entry, id_score_entry]:
             entry.bind("<Return>", lambda _event: self.apply_threshold_settings())
 
-        ttk.Label(status_row, textvariable=self.status_var, anchor="w").grid(row=0, column=0, sticky="ew")
+        ttk.Label(status_row, textvariable=self.status_var, anchor="w").grid(
+            row=0, column=0, sticky="ew"
+        )
+        ttk.Separator(status_row, orient=tk.VERTICAL).grid(
+            row=0, column=1, sticky="ns", padx=8
+        )
+        ttk.Label(status_row, text="缓冲目标").grid(row=0, column=2, padx=(0, 4))
+        cache_target_entry = ttk.Entry(
+            status_row, width=6, textvariable=self.cache_target_var
+        )
+        cache_target_entry.grid(row=0, column=3, padx=(0, 4))
+        cache_target_entry.bind("<Return>", lambda _event: self.apply_cache_target())
+        ttk.Button(status_row, text="应用", command=self.apply_cache_target).grid(
+            row=0, column=4, padx=(0, 8)
+        )
+        ttk.Label(status_row, textvariable=self.cache_status_var, anchor="w").grid(
+            row=0, column=5, sticky="w"
+        )
         self.update_label_option_state()
 
         body = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -1122,8 +1272,12 @@ class OpenCvJsonlViewer:
             cursor="fleur",
         )
         self.video_canvas.grid(row=0, column=0, sticky="nsew")
-        canvas_yscroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.video_canvas.yview)
-        canvas_xscroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.video_canvas.xview)
+        canvas_yscroll = ttk.Scrollbar(
+            canvas_frame, orient=tk.VERTICAL, command=self.video_canvas.yview
+        )
+        canvas_xscroll = ttk.Scrollbar(
+            canvas_frame, orient=tk.HORIZONTAL, command=self.video_canvas.xview
+        )
         canvas_yscroll.grid(row=0, column=1, sticky="ns")
         canvas_xscroll.grid(row=1, column=0, sticky="ew")
         self.video_canvas.configure(
@@ -1143,12 +1297,16 @@ class OpenCvJsonlViewer:
 
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
-        ttk.Label(right, text="当前叠加用 JSON 原数据", font=("", 11, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(right, text="当前叠加用 JSON 原数据", font=("", 11, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
 
         self.json_text = tk.Text(right, wrap=tk.NONE)
         self.json_text.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
         yscroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.json_text.yview)
-        xscroll = ttk.Scrollbar(right, orient=tk.HORIZONTAL, command=self.json_text.xview)
+        xscroll = ttk.Scrollbar(
+            right, orient=tk.HORIZONTAL, command=self.json_text.xview
+        )
         yscroll.grid(row=1, column=1, sticky="ns", pady=(6, 0))
         xscroll.grid(row=2, column=0, sticky="ew")
         self.json_text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
@@ -1181,7 +1339,9 @@ class OpenCvJsonlViewer:
             initialdir = self.video_dir if self.video_dir.is_dir() else PROJECT_DIR
             dialog_title = "选择视频目录"
         else:
-            initialdir = self.frame_image_dir if self.frame_image_dir.is_dir() else PROJECT_DIR
+            initialdir = (
+                self.frame_image_dir if self.frame_image_dir.is_dir() else PROJECT_DIR
+            )
             dialog_title = "选择图片目录"
 
         selected = filedialog.askdirectory(
@@ -1206,9 +1366,19 @@ class OpenCvJsonlViewer:
             self.frame_image_dir = selected_path
             self.status_var.set(f"已切换图片目录：{self.frame_image_dir}")
 
+        if not self.store.cameras:
+            if messagebox.askyesno(
+                "选择 JSONL", "尚未加载 JSONL 数据，是否现在选择 JSONL 文件？"
+            ):
+                self.choose_jsonl()
+            return
+
         self.open_camera(self.current_camera, target_pts=current_pts)
 
     def choose_jsonl(self) -> None:
+        if self.jsonl_loading:
+            messagebox.showinfo("正在加载", "JSONL 正在加载中，请稍候")
+            return
         selected = filedialog.askopenfilename(
             title="选择 JSONL 文件",
             initialdir=str(PROJECT_DIR),
@@ -1222,28 +1392,124 @@ class OpenCvJsonlViewer:
             return
 
         selected_path = Path(selected).expanduser().resolve()
-        current_pts = self.current_display_pts()
-        current_camera = self.current_camera
-
-        try:
-            new_store = load_annotations(selected_path)
-        except Exception as exc:
-            messagebox.showerror("读取 JSONL 失败", str(exc))
+        if not selected_path.is_file():
+            messagebox.showerror("文件不存在", f"找不到文件：{selected_path}")
             return
-        if not new_store.cameras:
-            messagebox.showerror("读取 JSONL 失败", "这个 JSONL 里没有可用相机数据")
+        self.start_jsonl_load(selected_path)
+
+    def load_preset_resources(self) -> None:
+        if self.jsonl_loading:
+            messagebox.showinfo("正在加载", "JSONL 正在加载中，请稍候")
+            return
+        args = parse_args()
+        video_dir = args.video_dir.expanduser().resolve()
+        frame_image_dir = args.frame_image_dir.expanduser().resolve()
+        jsonl_path = args.jsonl.expanduser().resolve()
+
+        if not jsonl_path.is_file():
+            messagebox.showerror(
+                "预设资源加载失败", f"找不到预设 JSONL 文件：\n{jsonl_path}"
+            )
             return
 
+        self.video_dir = video_dir
+        self.frame_image_dir = frame_image_dir
+        self.start_jsonl_load(jsonl_path, preset_camera=args.camera)
+
+    def start_jsonl_load(
+        self, jsonl_path: Path, preset_camera: int | None = None
+    ) -> None:
         self.is_playing = False
+        self.jsonl_loading = True
+        self.status_var.set(f"正在加载 JSONL：{jsonl_path.name} ...")
+
+        def progress_cb(pct: int, lines: int, cameras: int) -> None:
+            self.jsonl_load_queue.put(
+                {
+                    "kind": "progress",
+                    "pct": pct,
+                    "lines": lines,
+                    "cameras": cameras,
+                    "path": str(jsonl_path),
+                }
+            )
+
+        def worker() -> None:
+            try:
+                new_store = load_annotations(jsonl_path, progress_callback=progress_cb)
+                self.jsonl_load_queue.put(
+                    {
+                        "kind": "done",
+                        "store": new_store,
+                        "path": jsonl_path,
+                        "preset_camera": preset_camera,
+                        "error": None,
+                    }
+                )
+            except Exception as exc:
+                self.jsonl_load_queue.put(
+                    {
+                        "kind": "done",
+                        "store": None,
+                        "path": jsonl_path,
+                        "preset_camera": preset_camera,
+                        "error": str(exc),
+                    }
+                )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    def process_jsonl_load_results(self) -> None:
+        try:
+            while True:
+                result = self.jsonl_load_queue.get_nowait()
+                kind = result.get("kind")
+                if kind == "progress":
+                    pct = result["pct"]
+                    lines = result["lines"]
+                    cameras = result["cameras"]
+                    path = result["path"]
+                    name = Path(path).name
+                    self.status_var.set(
+                        f"正在加载 JSONL：{name} | {pct}% | {lines} 行 | {cameras} 路相机"
+                    )
+                elif kind == "done":
+                    self.handle_jsonl_load_done(result)
+        except queue.Empty:
+            pass
+
+        if self.root.winfo_exists():
+            self.root.after(100, self.process_jsonl_load_results)
+
+    def handle_jsonl_load_done(self, result: dict[str, Any]) -> None:
+        self.jsonl_loading = False
+        error = result.get("error")
+        new_store = result.get("store")
+        jsonl_path = result.get("path")
+        preset_camera = result.get("preset_camera")
+
+        if error is not None:
+            messagebox.showerror("读取 JSONL 失败", str(error))
+            self.status_var.set(f"JSONL 加载失败：{error}")
+            return
+        if new_store is None or not new_store.cameras:
+            messagebox.showerror("读取 JSONL 失败", "JSONL 里没有可用相机数据")
+            self.status_var.set("JSONL 加载失败：没有可用相机数据")
+            return
+
         self.cancel_video_task()
         self.clear_video_cache()
         self.close_video_readers()
         self.video_keyframe_indexes.clear()
         self.store = new_store
-        self.current_jsonl_path = selected_path
+        self.current_jsonl_path = jsonl_path
         self.refresh_camera_choices()
 
-        if current_camera in self.store.cameras:
+        current_camera = self.current_camera
+        if preset_camera is not None and preset_camera in self.store.cameras:
+            camera_id = preset_camera
+        elif current_camera in self.store.cameras:
             camera_id = current_camera
         else:
             camera_id = sorted(self.store.cameras)[0]
@@ -1252,13 +1518,19 @@ class OpenCvJsonlViewer:
         self.current_index = 0
         self.current_raw_frame = None
 
-        self.status_var.set(f"已切换 JSONL：{selected_path}")
-        self.open_camera(camera_id, target_pts=current_pts)
+        summary = new_store.summary
+        self.status_var.set(
+            f"JSONL 加载完成：{Path(str(jsonl_path)).name} | "
+            f"{summary.get('total_lines', 0)} 行 | "
+            f"{summary.get('camera_count', 0)} 路相机"
+        )
+        self.open_camera(camera_id)
 
     def clear_video_cache(self) -> None:
         self.video_frame_cache.clear()
         self.video_cache_start = 0
         self.video_cache_end = -1
+        self.update_cache_status()
 
     def update_video_cache_bounds(self) -> None:
         if self.video_frame_cache:
@@ -1276,15 +1548,71 @@ class OpenCvJsonlViewer:
             if frame_index < keep_from_index:
                 del self.video_frame_cache[frame_index]
 
-        while len(self.video_frame_cache) > VIDEO_CACHE_MAX_FRAMES:
+        max_frames = max(8, self.video_cache_max_frames)
+        while len(self.video_frame_cache) > max_frames:
             oldest_index = min(self.video_frame_cache)
+            if oldest_index >= self.current_index:
+                break
             del self.video_frame_cache[oldest_index]
 
         self.update_video_cache_bounds()
+        self.update_cache_status()
 
-    def merge_video_cache(self, cache: dict[int, Any], keep_from_index: int | None = None) -> None:
+    def merge_video_cache(
+        self, cache: dict[int, Any], keep_from_index: int | None = None
+    ) -> None:
         self.video_frame_cache.update(cache)
         self.trim_video_cache(keep_from_index)
+
+    def update_cache_status(self) -> None:
+        if not hasattr(self, "cache_status_var"):
+            return
+        if not self.is_video_mode():
+            self.cache_status_var.set("缓冲：图片模式不启用")
+            return
+        cached_count = len(self.video_frame_cache)
+        ahead = (
+            max(0, self.video_cache_end - self.current_index)
+            if self.video_frame_cache
+            else 0
+        )
+        target = self.video_prefetch_target_ahead
+        max_frames = self.video_cache_max_frames
+        parts = [f"已缓冲 {cached_count}/{max_frames} 帧", f"前向 {ahead}/{target}"]
+        if self.video_loading:
+            parts.append(
+                f"主解码中(帧 {self.video_loading_frame_index + 1 if self.video_loading_frame_index is not None else '?'})"
+            )
+        if self.video_prefetching:
+            parts.append(
+                f"预取中(起 {self.video_prefetch_start_index + 1 if self.video_prefetch_start_index is not None else '?'})"
+            )
+        if not self.video_loading and not self.video_prefetching:
+            parts.append("空闲")
+        self.cache_status_var.set("缓冲：" + " | ".join(parts))
+
+    def apply_cache_target(self) -> None:
+        try:
+            target = int(self.cache_target_var.get())
+        except ValueError:
+            messagebox.showerror("输入错误", "缓冲目标帧数必须是整数")
+            return
+        if target < 8:
+            messagebox.showerror("输入错误", "缓冲目标至少 8 帧")
+            return
+        if target > 4096:
+            messagebox.showerror("输入错误", "缓冲目标过大，建议不超过 4096")
+            return
+        self.video_prefetch_target_ahead = target
+        self.video_cache_max_frames = max(
+            target + VIDEO_CACHE_KEEP_BEHIND + 16, target * 2
+        )
+        self.video_prefetch_after = max(VIDEO_PREFETCH_AFTER, target // 2)
+        self.status_var.set(
+            f"已设置缓冲目标：前向 {target} 帧，缓存上限 {self.video_cache_max_frames} 帧"
+        )
+        self.update_cache_status()
+        self.maybe_prefetch_video()
 
     def close_video_readers(self) -> None:
         for reader in self.video_readers.values():
@@ -1296,12 +1624,23 @@ class OpenCvJsonlViewer:
         if reader is not None:
             reader.close()
 
+    def resolve_video_path(self, camera_id: int) -> Path | None:
+        m3u8_path = self.video_dir / f"{camera_id}.m3u8"
+        if m3u8_path.is_file():
+            return m3u8_path
+        ts_path = self.video_dir / f"{camera_id}.ts"
+        if ts_path.is_file():
+            return ts_path
+        return None
+
     def start_video_task(self, camera_id: int, frame_index: int) -> int:
         self.video_task_token += 1
         self.video_loading = True
         self.video_loading_camera = camera_id
         self.video_loading_frame_index = frame_index
-        self.status_var.set(f"视频模式 | 相机 {camera_id} | 正在后台解码第 {frame_index + 1} 帧...")
+        self.status_var.set(
+            f"视频模式 | 相机 {camera_id} | 正在后台解码第 {frame_index + 1} 帧..."
+        )
         return self.video_task_token
 
     def cancel_video_task(self) -> None:
@@ -1386,10 +1725,14 @@ class OpenCvJsonlViewer:
             self.video_keyframe_indexes[camera_id] = key_index
         if reader is not None:
             self.video_readers[camera_id] = reader
-        self.merge_video_cache(cache, keep_from_index=max(0, frame_index - VIDEO_CACHE_KEEP_BEHIND))
+        self.merge_video_cache(
+            cache, keep_from_index=max(0, frame_index - VIDEO_CACHE_KEEP_BEHIND)
+        )
 
         if frame is None:
-            self.status_var.set(f"读取视频帧失败：camera={camera_id}, frame={frame_index + 1}")
+            self.status_var.set(
+                f"读取视频帧失败：camera={camera_id}, frame={frame_index + 1}"
+            )
             return
 
         self.current_index = frame_index
@@ -1434,7 +1777,9 @@ class OpenCvJsonlViewer:
         if reader is not None:
             return reader
 
-        playlist_path = self.video_dir / f"{self.current_camera}.m3u8"
+        playlist_path = self.resolve_video_path(self.current_camera)
+        if playlist_path is None:
+            raise FileNotFoundError(f"找不到相机 {self.current_camera} 的视频文件")
         annotation = self.get_annotation()
         key_index = self.get_video_keyframe_index()
         reader = PyAvVideoFrameReader(playlist_path, annotation, key_index)
@@ -1449,7 +1794,7 @@ class OpenCvJsonlViewer:
                 target_frame_index,
                 before=VIDEO_CACHE_BEFORE,
                 after=VIDEO_CACHE_AFTER,
-                max_frames=VIDEO_CACHE_MAX_FRAMES,
+                max_frames=self.video_cache_max_frames,
             )
         except Exception as exc:
             self.status_var.set(f"PyAV 解码失败：{exc}")
@@ -1460,15 +1805,18 @@ class OpenCvJsonlViewer:
 
         self.video_cache_start = min(self.video_frame_cache)
         self.video_cache_end = max(self.video_frame_cache)
+        self.update_cache_status()
         return self.video_frame_cache.get(target_frame_index)
 
     def seek_and_render_video_async(self, frame_index: int) -> None:
         annotation = self.get_annotation()
         frame_index = max(0, min(frame_index, len(annotation.items) - 1))
         camera_id = self.current_camera
-        playlist_path = self.video_dir / f"{camera_id}.m3u8"
-        if not playlist_path.is_file():
-            messagebox.showerror("视频不存在", f"找不到视频文件：{playlist_path}")
+        playlist_path = self.resolve_video_path(camera_id)
+        if playlist_path is None:
+            messagebox.showerror(
+                "视频不存在", f"找不到相机 {camera_id} 的视频文件（.m3u8 或 .ts）"
+            )
             return
 
         cached_frame = self.video_frame_cache.get(frame_index)
@@ -1479,7 +1827,9 @@ class OpenCvJsonlViewer:
             self.maybe_prefetch_video()
             return
 
+        max_frames = self.video_cache_max_frames
         token = self.start_video_task(camera_id, frame_index)
+        self.update_cache_status()
 
         def worker() -> None:
             try:
@@ -1489,7 +1839,9 @@ class OpenCvJsonlViewer:
 
                     if camera_id not in self.video_keyframe_indexes:
                         annotation_local = self.store.cameras[camera_id]
-                        key_index = build_video_keyframe_index(playlist_path, annotation_local)
+                        key_index = build_video_keyframe_index(
+                            playlist_path, annotation_local
+                        )
                     else:
                         key_index = self.video_keyframe_indexes[camera_id]
 
@@ -1499,7 +1851,9 @@ class OpenCvJsonlViewer:
                     reader = self.video_readers.get(camera_id)
                     if reader is None:
                         annotation_local = self.store.cameras[camera_id]
-                        reader = PyAvVideoFrameReader(playlist_path, annotation_local, key_index)
+                        reader = PyAvVideoFrameReader(
+                            playlist_path, annotation_local, key_index
+                        )
                     else:
                         reader.keyframe_index = key_index
                         reader.annotation = self.store.cameras[camera_id]
@@ -1508,7 +1862,7 @@ class OpenCvJsonlViewer:
                         frame_index,
                         before=VIDEO_CACHE_BEFORE,
                         after=VIDEO_CACHE_AFTER,
-                        max_frames=VIDEO_CACHE_MAX_FRAMES,
+                        max_frames=max_frames,
                     )
                 frame = cache.get(frame_index)
                 error = None if frame is not None else "解码结果里没有目标帧"
@@ -1550,7 +1904,8 @@ class OpenCvJsonlViewer:
             return
 
         cached_ahead = self.video_cache_end - self.current_index
-        if cached_ahead >= VIDEO_PREFETCH_TARGET_AHEAD:
+        if cached_ahead >= self.video_prefetch_target_ahead:
+            self.update_cache_status()
             return
 
         start_index = self.video_cache_end + 1
@@ -1558,11 +1913,15 @@ class OpenCvJsonlViewer:
             return
 
         camera_id = self.current_camera
-        playlist_path = self.video_dir / f"{camera_id}.m3u8"
-        if not playlist_path.is_file():
+        playlist_path = self.resolve_video_path(camera_id)
+        if playlist_path is None:
             return
 
+        prefetch_after = self.video_prefetch_after
+        max_frames = self.video_cache_max_frames
+
         token = self.start_video_prefetch_task(camera_id, start_index)
+        self.update_cache_status()
 
         def worker() -> None:
             try:
@@ -1572,7 +1931,9 @@ class OpenCvJsonlViewer:
 
                     if camera_id not in self.video_keyframe_indexes:
                         annotation_local = self.store.cameras[camera_id]
-                        key_index = build_video_keyframe_index(playlist_path, annotation_local)
+                        key_index = build_video_keyframe_index(
+                            playlist_path, annotation_local
+                        )
                     else:
                         key_index = self.video_keyframe_indexes[camera_id]
 
@@ -1582,7 +1943,9 @@ class OpenCvJsonlViewer:
                     reader = self.video_readers.get(camera_id)
                     if reader is None:
                         annotation_local = self.store.cameras[camera_id]
-                        reader = PyAvVideoFrameReader(playlist_path, annotation_local, key_index)
+                        reader = PyAvVideoFrameReader(
+                            playlist_path, annotation_local, key_index
+                        )
                     else:
                         reader.keyframe_index = key_index
                         reader.annotation = self.store.cameras[camera_id]
@@ -1590,8 +1953,8 @@ class OpenCvJsonlViewer:
                     cache = reader.decode_cache_window(
                         start_index,
                         before=0,
-                        after=VIDEO_PREFETCH_AFTER,
-                        max_frames=VIDEO_CACHE_MAX_FRAMES,
+                        after=prefetch_after,
+                        max_frames=max_frames,
                     )
                 error = None
             except Exception as exc:
@@ -1654,14 +2017,19 @@ class OpenCvJsonlViewer:
     def open_camera(self, camera_id: int, target_pts: int | None = None) -> None:
         self.is_playing = False
         self.cancel_video_task()
+        if not self.store.cameras:
+            self.status_var.set("尚未加载 JSONL 数据")
+            return
         if camera_id not in self.store.cameras:
             messagebox.showerror("相机不存在", f"JSONL 中没有相机 {camera_id} 的数据")
             return
 
         if self.is_video_mode():
-            playlist_path = self.video_dir / f"{camera_id}.m3u8"
-            if not playlist_path.is_file():
-                messagebox.showerror("视频不存在", f"找不到视频文件：{playlist_path}")
+            playlist_path = self.resolve_video_path(camera_id)
+            if playlist_path is None:
+                messagebox.showerror(
+                    "视频不存在", f"找不到相机 {camera_id} 的视频文件（.m3u8 或 .ts）"
+                )
                 return
 
         if camera_id != self.current_camera:
@@ -1720,7 +2088,9 @@ class OpenCvJsonlViewer:
             return
 
         next_index = self.current_index + 1
-        if self.video_loading and (not self.is_video_mode() or next_index not in self.video_frame_cache):
+        if self.video_loading and (
+            not self.is_video_mode() or next_index not in self.video_frame_cache
+        ):
             self.root.after(PLAY_INTERVAL_MS, self.play_tick)
             return
 
@@ -1864,7 +2234,9 @@ class OpenCvJsonlViewer:
 
     def step_frame(self, step: int) -> None:
         target_index = self.current_index + step
-        if self.video_loading and (not self.is_video_mode() or target_index not in self.video_frame_cache):
+        if self.video_loading and (
+            not self.is_video_mode() or target_index not in self.video_frame_cache
+        ):
             return
         self.seek_and_render(target_index)
 
@@ -1928,7 +2300,12 @@ class OpenCvJsonlViewer:
 
     def render_frame(self, frame: Any) -> None:
         annotation = self.get_annotation()
-        json_index = max(0, min(self.current_index + self.json_offset_frames, len(annotation.items) - 1))
+        json_index = max(
+            0,
+            min(
+                self.current_index + self.json_offset_frames, len(annotation.items) - 1
+            ),
+        )
         item = annotation.items[json_index]
         pts = annotation.pts_values[self.current_index]
         json_pts = annotation.pts_values[json_index]
@@ -1962,7 +2339,9 @@ class OpenCvJsonlViewer:
             team_score_threshold=self.current_team_score_threshold,
             id_score_threshold=self.current_id_score_threshold,
         )
-        self.draw_overlay_header(display_frame, item, pts, json_index, json_pts, label_scale)
+        self.draw_overlay_header(
+            display_frame, item, pts, json_index, json_pts, label_scale
+        )
         self.show_frame(display_frame)
         self.show_json(item)
 
@@ -1979,9 +2358,7 @@ class OpenCvJsonlViewer:
         video_cache_status = ""
         if self.is_video_mode():
             prefetch_status = "预读中 | " if self.video_prefetching else ""
-            video_cache_status = (
-                f"视频缓存 {self.video_cache_start + 1}-{self.video_cache_end + 1} | {prefetch_status}"
-            )
+            video_cache_status = f"视频缓存 {self.video_cache_start + 1}-{self.video_cache_end + 1} | {prefetch_status}"
         self.is_updating_progress = True
         self.progress_var.set(self.current_index + 1)
         self.is_updating_progress = False
@@ -2033,14 +2410,20 @@ class OpenCvJsonlViewer:
         )
 
     def show_frame(self, frame: Any) -> None:
-        xview = self.video_canvas.xview() if hasattr(self, "video_canvas") else (0.0, 1.0)
-        yview = self.video_canvas.yview() if hasattr(self, "video_canvas") else (0.0, 1.0)
+        xview = (
+            self.video_canvas.xview() if hasattr(self, "video_canvas") else (0.0, 1.0)
+        )
+        yview = (
+            self.video_canvas.yview() if hasattr(self, "video_canvas") else (0.0, 1.0)
+        )
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
         photo = ImageTk.PhotoImage(image=image)
         self.current_frame_image = photo
         if self.canvas_image_id is None:
-            self.canvas_image_id = self.video_canvas.create_image(0, 0, image=photo, anchor="nw")
+            self.canvas_image_id = self.video_canvas.create_image(
+                0, 0, image=photo, anchor="nw"
+            )
         else:
             self.video_canvas.itemconfigure(self.canvas_image_id, image=photo)
         self.video_canvas.configure(scrollregion=(0, 0, frame.shape[1], frame.shape[0]))
@@ -2090,16 +2473,8 @@ def main() -> None:
 
         video_dir = args.video_dir.expanduser().resolve()
         frame_image_dir = args.frame_image_dir.expanduser().resolve()
-        jsonl_path = args.jsonl.expanduser().resolve()
-        if not video_dir.is_dir():
-            print(f"提示：视频目录不存在，视频模式暂不可用：{video_dir}")
-        if not frame_image_dir.is_dir():
-            print(f"提示：图片帧目录不存在，图片模式暂不可用：{frame_image_dir}")
 
-        store = load_annotations(jsonl_path)
-        if args.camera not in store.cameras:
-            available = ", ".join(str(camera_id) for camera_id in sorted(store.cameras))
-            raise ValueError(f"JSONL 中没有相机 {args.camera}，可用相机：{available}")
+        store = AnnotationStore()
 
         root = tk.Tk()
         app = OpenCvJsonlViewer(root, video_dir, frame_image_dir, store, args.camera)
@@ -2107,9 +2482,6 @@ def main() -> None:
         root.mainloop()
     except RuntimeError as exc:
         print(exc, file=sys.stderr)
-        pause_before_exit(1)
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"启动失败：{exc}", file=sys.stderr)
         pause_before_exit(1)
     except tk.TclError as exc:
         print(f"无法创建图形界面：{exc}", file=sys.stderr)
