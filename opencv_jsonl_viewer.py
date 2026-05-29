@@ -521,7 +521,8 @@ def camera_id_from_item(item: dict[str, Any]) -> int | None:
         if stem.isdigit():
             return int(stem)
 
-    cam_idx = item.get("result", {}).get("cam_idx")
+    result = item.get("result")
+    cam_idx = result.get("cam_idx") if isinstance(result, dict) else None
     if isinstance(cam_idx, int):
         return cam_idx + 101
     return None
@@ -566,6 +567,9 @@ def load_annotations(
         except json.JSONDecodeError:
             bad_lines += 1
             return
+        if not isinstance(item, dict):
+            bad_lines += 1
+            return
 
         camera_id = camera_id_from_item(item)
         pts = item.get("pts")
@@ -583,9 +587,11 @@ def load_annotations(
         camera_annotation.pts_to_index[int(pts)] = len(camera_annotation.items) - 1
         camera_line_counts[camera_id] += 1
 
-        result = item.get("result") or {}
-        player_count += len(result.get("players") or [])
-        ball_count += len(result.get("balls") or [])
+        result, _result_missing = result_dict_from_item(item)
+        players, _players_state = detection_list_from_result(result, "players")
+        balls, _balls_state = detection_list_from_result(result, "balls")
+        player_count += len(players)
+        ball_count += len(balls)
 
         if progress_callback and total_lines - last_report >= 500:
             last_report = total_lines
@@ -700,7 +706,78 @@ def build_video_keyframe_index(
     )
 
 
+MISSING_TEXT = "-"
+
+
+def result_dict_from_item(item: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    result = item.get("result")
+    if isinstance(result, dict):
+        return result, False
+    return {}, True
+
+
+def detection_list_from_result(
+    result: dict[str, Any],
+    field_name: str,
+) -> tuple[list[dict[str, Any]], str]:
+    if field_name not in result:
+        return [], "missing"
+    value = result.get(field_name)
+    if value is None:
+        return [], "missing"
+    if not isinstance(value, list):
+        return [], "invalid"
+    return [item for item in value if isinstance(item, dict)], "ok"
+
+
+def detection_count_text(result: dict[str, Any], field_name: str, label: str) -> str:
+    items, state = detection_list_from_result(result, field_name)
+    if state == "missing":
+        return f"{label} 缺失"
+    if state == "invalid":
+        return f"{label} 格式异常"
+    return f"{label} {len(items)}"
+
+
+def field_text(data: dict[str, Any], field_name: str) -> str:
+    if field_name not in data:
+        return MISSING_TEXT
+    value = data.get(field_name)
+    if value is None:
+        return "null"
+    return str(value)
+
+
+def score_text(data: dict[str, Any], field_name: str) -> str:
+    if field_name not in data or data.get(field_name) is None:
+        return MISSING_TEXT
+    try:
+        return f"{float(data[field_name]):.2f}"
+    except (TypeError, ValueError):
+        return MISSING_TEXT
+
+
+def scaled_bbox(
+    bbox: Any,
+    scale_x: float,
+    scale_y: float,
+) -> tuple[int, int, int, int] | None:
+    if not isinstance(bbox, list) or len(bbox) < 4:
+        return None
+    try:
+        return (
+            int(round(float(bbox[0]) * scale_x)),
+            int(round(float(bbox[1]) * scale_y)),
+            int(round(float(bbox[2]) * scale_x)),
+            int(round(float(bbox[3]) * scale_y)),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def player_id_text(player: dict[str, Any]) -> str:
+    if "player_id" not in player:
+        return MISSING_TEXT
     player_id = player.get("player_id")
     if player_id is None:
         return "null"
@@ -998,23 +1075,23 @@ def build_player_label(
             return f"id:{player_id}"
         return (
             f"id:{player_id} "
-            f"{player.get('reid_team')} "
-            f"det:{safe_score(player.get('score')):.2f} "
-            f"team_s:{safe_score(player.get('reid_score')):.2f} "
-            f"id_s:{safe_score(player.get('player_id_score')):.2f}"
+            f"{field_text(player, 'reid_team')} "
+            f"det:{score_text(player, 'score')} "
+            f"team_s:{score_text(player, 'reid_score')} "
+            f"id_s:{score_text(player, 'player_id_score')}"
         )
 
     parts: list[str] = []
     if show_id:
         parts.append(f"id:{player_id}")
     if show_team:
-        parts.append(str(player.get("reid_team")))
+        parts.append(field_text(player, "reid_team"))
     if show_det:
-        parts.append(f"det:{safe_score(player.get('score')):.2f}")
+        parts.append(f"det:{score_text(player, 'score')}")
     if show_team_score:
-        parts.append(f"team_s:{safe_score(player.get('reid_score')):.2f}")
+        parts.append(f"team_s:{score_text(player, 'reid_score')}")
     if show_id_score:
-        parts.append(f"id_s:{safe_score(player.get('player_id_score')):.2f}")
+        parts.append(f"id_s:{score_text(player, 'player_id_score')}")
     return " ".join(parts)
 
 
@@ -1037,7 +1114,7 @@ def draw_detections(
     team_score_threshold: float,
     id_score_threshold: float,
 ) -> None:
-    result = item.get("result") or {}
+    result, _result_missing = result_dict_from_item(item)
     box_thickness = max(1, int(round(label_scale * 3)))
     point_radius = max(1, int(round(label_scale * 3)))
     label_thickness = max(1, int(round(label_scale * 3)))
@@ -1047,17 +1124,13 @@ def draw_detections(
     ]
 
     if show_players:
-        for player in result.get("players") or []:
-            bbox = player.get("bbox")
-            if not isinstance(bbox, list) or len(bbox) < 4:
+        players, _players_state = detection_list_from_result(result, "players")
+        for player in players:
+            bbox_rect = scaled_bbox(player.get("bbox"), scale_x, scale_y)
+            if bbox_rect is None:
                 continue
 
-            x1, y1, x2, y2 = [
-                int(round(float(bbox[0]) * scale_x)),
-                int(round(float(bbox[1]) * scale_y)),
-                int(round(float(bbox[2]) * scale_x)),
-                int(round(float(bbox[3]) * scale_y)),
-            ]
+            x1, y1, x2, y2 = bbox_rect
             team = player.get("reid_team")
             color = TEAM_COLORS_BGR.get(team, (230, 230, 230))
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_thickness)
@@ -1105,7 +1178,10 @@ def draw_detections(
                 occupied_labels.append(rect)
 
             if show_keypoints:
-                for point in player.get("2d_keypoints") or []:
+                keypoints = player.get("2d_keypoints")
+                if not isinstance(keypoints, list):
+                    keypoints = []
+                for point in keypoints:
                     if not isinstance(point, list) or len(point) < 2:
                         continue
                     px = int(round(float(point[0]) * scale_x))
@@ -1113,21 +1189,17 @@ def draw_detections(
                     cv2.circle(frame, (px, py), point_radius, KEYPOINT_COLOR_BGR, -1)
 
     if show_balls:
-        for ball in result.get("balls") or []:
-            bbox = ball.get("bbox")
-            if not isinstance(bbox, list) or len(bbox) < 4:
+        balls, _balls_state = detection_list_from_result(result, "balls")
+        for ball in balls:
+            bbox_rect = scaled_bbox(ball.get("bbox"), scale_x, scale_y)
+            if bbox_rect is None:
                 continue
 
-            x1, y1, x2, y2 = [
-                int(round(float(bbox[0]) * scale_x)),
-                int(round(float(bbox[1]) * scale_y)),
-                int(round(float(bbox[2]) * scale_x)),
-                int(round(float(bbox[3]) * scale_y)),
-            ]
+            x1, y1, x2, y2 = bbox_rect
             cv2.rectangle(
                 frame, (x1, y1), (x2, y2), BALL_COLOR_BGR, max(2, box_thickness + 1)
             )
-            label = f"ball {float(ball.get('score', 0)):.2f}"
+            label = f"ball {score_text(ball, 'score')}"
             label_x, label_y = find_label_position(
                 frame,
                 label,
@@ -3190,9 +3262,10 @@ class OpenCvJsonlViewer:
         self.show_frame(display_frame)
         self.show_json(item)
 
-        result = item.get("result") or {}
-        players = len(result.get("players") or [])
-        balls = len(result.get("balls") or [])
+        result, result_missing = result_dict_from_item(item)
+        players_text = detection_count_text(result, "players", "players")
+        balls_text = detection_count_text(result, "balls", "balls")
+        schema_status = "result 缺失 | " if result_missing else ""
         threshold_status = ""
         if self.label_mode_var.get() == "排错模式":
             threshold_status = (
@@ -3215,7 +3288,7 @@ class OpenCvJsonlViewer:
             f"帧 {self.current_index + 1}/{len(annotation.items)} | "
             f"图片 PTS {pts} | JSON偏移 {self.json_offset_frames:+d} | "
             f"JSON帧 {json_index + 1}/{len(annotation.items)} | JSON PTS {json_pts} | "
-            f"players {players} | balls {balls} | "
+            f"{schema_status}{players_text} | {balls_text} | "
             f"原始尺寸 {frame_w}x{frame_h} -> 显示尺寸 {self.display_width}x{self.display_height} | "
             f"标签 {self.label_mode_var.get()} | "
             f"{threshold_status}"
@@ -3232,17 +3305,21 @@ class OpenCvJsonlViewer:
         json_pts: int,
         label_scale: float,
     ) -> None:
-        result = item.get("result") or {}
+        result, result_missing = result_dict_from_item(item)
+        players_text = detection_count_text(result, "players", "players")
+        balls_text = detection_count_text(result, "balls", "balls")
+        result_text = "result missing  " if result_missing else ""
         text = (
             f"camera {self.current_camera}  "
-            f"cam_idx {result.get('cam_idx')}  "
+            f"cam_idx {field_text(result, 'cam_idx')}  "
             f"frame {self.current_index + 1}  "
             f"pts {pts}  "
             f"json_offset {self.json_offset_frames:+d}  "
             f"json_frame {json_index + 1}  "
             f"json_pts {json_pts}  "
-            f"players {len(result.get('players') or [])}  "
-            f"balls {len(result.get('balls') or [])}"
+            f"{result_text}"
+            f"{players_text}  "
+            f"{balls_text}"
         )
         draw_label(
             frame,
