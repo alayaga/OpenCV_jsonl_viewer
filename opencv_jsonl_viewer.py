@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+import os
 import queue
 import sys
 import threading
@@ -21,13 +22,20 @@ import tkinter as tk
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 try:
     import cv2
 except ImportError:
     cv2 = None
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 try:
     import av
@@ -81,6 +89,11 @@ VIDEO_CACHE_KEEP_BEHIND = 6
 VIDEO_PREFETCH_AFTER = 90
 VIDEO_PREFETCH_TARGET_AHEAD = 180
 VIDEO_RESULT_POLL_MS = 30
+
+# 网络图片模式预加载范围。只对 tos/http 图片目录生效。
+IMAGE_PREFETCH_BEFORE = 12
+IMAGE_PREFETCH_AFTER = 36
+IMAGE_CACHE_MAX_FRAMES = 300
 
 # 排错模式下的异常阈值。
 ABNORMAL_DET_THRESHOLD = 0.60
@@ -225,10 +238,237 @@ class PyAvVideoFrameReader:
         return cache
 
 
+REMOTE_SCHEMES = ("http://", "https://", "tos://")
+DEFAULT_TOS_HTTP_TEMPLATE = "https://{bucket}.tos-cn-beijing.volces.com/{key}"
+
+
+def resource_to_text(resource: Any) -> str:
+    return str(resource).strip()
+
+
+def is_remote_resource(resource: Any) -> bool:
+    text = resource_to_text(resource).lower()
+    return text.startswith(REMOTE_SCHEMES)
+
+
+def is_tos_resource(resource: Any) -> bool:
+    return resource_to_text(resource).lower().startswith("tos://")
+
+
+def display_resource_name(resource: Any) -> str:
+    text = resource_to_text(resource)
+    if is_remote_resource(text):
+        parsed = urlparse(text)
+        name = Path(parsed.path.rstrip("/")).name
+        return name or parsed.netloc or text
+    return Path(text).name
+
+
+def local_path_from_resource(resource: Any) -> Path:
+    return Path(resource_to_text(resource)).expanduser()
+
+
+def normalize_local_or_remote_resource(resource: Any, *, must_be_file: bool = False) -> Any:
+    text = resource_to_text(resource)
+    if is_remote_resource(text):
+        return text.rstrip("/")
+    path = local_path_from_resource(text)
+    return path.resolve() if must_be_file else path.resolve()
+
+
+def tos_to_http_url(tos_uri: str) -> str:
+    parsed = urlparse(tos_uri)
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    if not bucket or not key:
+        raise ValueError(f"TOS 地址格式不正确：{tos_uri}")
+
+    quoted_key = quote(key, safe="/")
+    template = os.environ.get("TOS_HTTP_TEMPLATE") or DEFAULT_TOS_HTTP_TEMPLATE
+    return template.format(bucket=bucket, key=quoted_key, path=quoted_key)
+
+
+def resource_to_request_url(resource: Any) -> str:
+    text = resource_to_text(resource)
+    if is_tos_resource(text):
+        return tos_to_http_url(text)
+    return text
+
+
+def join_resource(base: Any, *parts: str) -> Any:
+    text = resource_to_text(base)
+    if is_remote_resource(text):
+        suffix = "/".join(quote(str(part).strip("/"), safe="") for part in parts)
+        return f"{text.rstrip('/')}/{suffix}"
+    path = local_path_from_resource(text)
+    for part in parts:
+        path = path / part
+    return path
+
+
+def open_remote_resource(resource: Any):
+    url = resource_to_request_url(resource)
+    request = Request(url, headers={"User-Agent": "opencv-jsonl-viewer/1.0"})
+    return urlopen(request, timeout=60)
+
+
+def read_remote_bytes(resource: Any) -> bytes:
+    with open_remote_resource(resource) as response:
+        return response.read()
+
+
+def decode_image_bytes(image_bytes: bytes) -> Any | None:
+    image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+    return cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+
+class ResourceDirectoryDialog(simpledialog.Dialog):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        initial_value: str,
+        initialdir: Path,
+    ):
+        self.initial_value = initial_value
+        self.initialdir = initialdir
+        self.entry: ttk.Entry | None = None
+        self.result: str | None = None
+        super().__init__(parent, title)
+
+    def body(self, master: tk.Widget) -> tk.Widget:
+        ttk.Label(
+            master,
+            text="输入本地目录或 tos/http URL。网络地址直接输入后点 OK。",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        self.entry = ttk.Entry(master, width=86)
+        self.entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.entry.insert(0, self.initial_value)
+        master.columnconfigure(0, weight=1)
+        return self.entry
+
+    def buttonbox(self) -> None:
+        box = ttk.Frame(self)
+        ttk.Button(box, text="OK", width=10, command=self.ok).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+        ttk.Button(box, text="选择本地", width=12, command=self.choose_local).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+        ttk.Button(box, text="取消", width=10, command=self.cancel).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+        self.bind("<Return>", self.ok)
+        self.bind("<Escape>", self.cancel)
+        box.pack()
+
+    def choose_local(self) -> None:
+        selected = filedialog.askdirectory(
+            title=self.title() or "选择本地目录",
+            initialdir=str(self.initialdir),
+            parent=self,
+        )
+        if not selected or self.entry is None:
+            return
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, str(Path(selected).expanduser().resolve()))
+
+    def validate(self) -> bool:
+        if self.entry is None:
+            return False
+        value = self.entry.get().strip()
+        if not value:
+            messagebox.showerror("输入错误", "目录不能为空", parent=self)
+            return False
+        return True
+
+    def apply(self) -> None:
+        if self.entry is not None:
+            self.result = self.entry.get().strip()
+
+
+class ResourceFileDialog(simpledialog.Dialog):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        initial_value: str,
+        initialdir: Path,
+    ):
+        self.initial_value = initial_value
+        self.initialdir = initialdir
+        self.entry: ttk.Entry | None = None
+        self.result: str | None = None
+        super().__init__(parent, title)
+
+    def body(self, master: tk.Widget) -> tk.Widget:
+        ttk.Label(
+            master,
+            text="输入本地 JSONL 文件路径或 tos/http URL。网络地址直接输入后点 OK。",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        self.entry = ttk.Entry(master, width=86)
+        self.entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.entry.insert(0, self.initial_value)
+        master.columnconfigure(0, weight=1)
+        return self.entry
+
+    def buttonbox(self) -> None:
+        box = ttk.Frame(self)
+        ttk.Button(box, text="OK", width=10, command=self.ok).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+        ttk.Button(box, text="选择本地", width=12, command=self.choose_local).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+        ttk.Button(box, text="取消", width=10, command=self.cancel).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+        self.bind("<Return>", self.ok)
+        self.bind("<Escape>", self.cancel)
+        box.pack()
+
+    def choose_local(self) -> None:
+        selected = filedialog.askopenfilename(
+            title=self.title() or "选择 JSONL 文件",
+            initialdir=str(self.initialdir),
+            filetypes=[
+                ("JSONL 文件", "*.jsonl"),
+                ("JSON 文件", "*.json"),
+                ("所有文件", "*.*"),
+            ],
+            parent=self,
+        )
+        if not selected or self.entry is None:
+            return
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, str(Path(selected).expanduser().resolve()))
+
+    def validate(self) -> bool:
+        if self.entry is None:
+            return False
+        value = self.entry.get().strip()
+        if not value:
+            messagebox.showerror("输入错误", "JSONL 路径不能为空", parent=self)
+            return False
+        return True
+
+    def apply(self) -> None:
+        if self.entry is not None:
+            self.result = self.entry.get().strip()
+
+
+class JsonlLoadCancelled(RuntimeError):
+    pass
+
+
 def require_dependencies() -> None:
     missing = []
     if cv2 is None:
         missing.append("opencv-python")
+    if np is None:
+        missing.append("numpy")
     if av is None:
         missing.append("av")
     if Image is None or ImageTk is None:
@@ -254,14 +494,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--jsonl",
-        type=Path,
-        default=JSONL_PATH,
+        type=str,
+        default=str(JSONL_PATH),
         help=f"JSONL 文件，默认：{JSONL_PATH}",
     )
     parser.add_argument(
         "--frame-image-dir",
-        type=Path,
-        default=FRAME_IMAGE_DIR,
+        type=str,
+        default=str(FRAME_IMAGE_DIR),
         help=f"按 pts 命名的 JPEG 帧目录，默认：{FRAME_IMAGE_DIR}",
     )
     parser.add_argument(
@@ -288,13 +528,15 @@ def camera_id_from_item(item: dict[str, Any]) -> int | None:
 
 
 def load_annotations(
-    jsonl_path: Path,
+    jsonl_path: Any,
     progress_callback: Any | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> AnnotationStore:
-    if not jsonl_path.is_file():
-        raise FileNotFoundError(f"找不到 JSONL 文件：{jsonl_path}")
+    jsonl_source = normalize_local_or_remote_resource(jsonl_path, must_be_file=True)
+    if not is_remote_resource(jsonl_source) and not Path(jsonl_source).is_file():
+        raise FileNotFoundError(f"找不到 JSONL 文件：{jsonl_source}")
 
-    file_size = jsonl_path.stat().st_size
+    file_size = Path(jsonl_source).stat().st_size if not is_remote_resource(jsonl_source) else 0
     store = AnnotationStore()
     total_lines = 0
     bad_lines = 0
@@ -304,45 +546,69 @@ def load_annotations(
     bytes_read = 0
     last_report = 0
 
-    print(f"正在读取 JSONL：{jsonl_path}")
-    with jsonl_path.open("r", encoding="utf-8") as file:
-        for line in file:
-            bytes_read += len(line.encode("utf-8"))
-            line = line.strip()
-            if not line:
-                continue
+    print(f"正在读取 JSONL：{jsonl_source}")
 
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                bad_lines += 1
-                continue
+    def check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise JsonlLoadCancelled("JSONL 加载已取消")
 
-            camera_id = camera_id_from_item(item)
-            pts = item.get("pts")
-            if camera_id is None or pts is None:
-                bad_lines += 1
-                continue
+    def handle_line(line: str) -> None:
+        nonlocal total_lines, bad_lines, player_count, ball_count
+        nonlocal bytes_read, last_report
 
-            total_lines += 1
-            camera_annotation = store.cameras.setdefault(
-                camera_id,
-                CameraAnnotation(camera_id=camera_id),
-            )
-            camera_annotation.items.append(item)
-            camera_annotation.pts_values.append(int(pts))
-            camera_annotation.pts_to_index[int(pts)] = len(camera_annotation.items) - 1
-            camera_line_counts[camera_id] += 1
+        check_cancelled()
+        line = line.strip()
+        if not line:
+            return
 
-            result = item.get("result") or {}
-            player_count += len(result.get("players") or [])
-            ball_count += len(result.get("balls") or [])
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            bad_lines += 1
+            return
 
-            if progress_callback and total_lines - last_report >= 500:
-                last_report = total_lines
-                pct = min(99, int(bytes_read * 100 / max(1, file_size)))
-                progress_callback(pct, total_lines, len(store.cameras))
+        camera_id = camera_id_from_item(item)
+        pts = item.get("pts")
+        if camera_id is None or pts is None:
+            bad_lines += 1
+            return
 
+        total_lines += 1
+        camera_annotation = store.cameras.setdefault(
+            camera_id,
+            CameraAnnotation(camera_id=camera_id),
+        )
+        camera_annotation.items.append(item)
+        camera_annotation.pts_values.append(int(pts))
+        camera_annotation.pts_to_index[int(pts)] = len(camera_annotation.items) - 1
+        camera_line_counts[camera_id] += 1
+
+        result = item.get("result") or {}
+        player_count += len(result.get("players") or [])
+        ball_count += len(result.get("balls") or [])
+
+        if progress_callback and total_lines - last_report >= 500:
+            last_report = total_lines
+            pct = min(99, int(bytes_read * 100 / max(1, file_size))) if file_size else 0
+            progress_callback(pct, total_lines, len(store.cameras))
+
+    if is_remote_resource(jsonl_source):
+        with open_remote_resource(jsonl_source) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length and content_length.isdigit():
+                file_size = int(content_length)
+            for raw_line in response:
+                check_cancelled()
+                bytes_read += len(raw_line)
+                handle_line(raw_line.decode("utf-8"))
+    else:
+        with Path(jsonl_source).open("r", encoding="utf-8") as file:
+            for line in file:
+                check_cancelled()
+                bytes_read += len(line.encode("utf-8"))
+                handle_line(line)
+
+    check_cancelled()
     if progress_callback:
         progress_callback(99, total_lines, len(store.cameras))
 
@@ -360,7 +626,7 @@ def load_annotations(
         }
 
     store.summary = {
-        "jsonl_path": str(jsonl_path),
+        "jsonl_path": str(jsonl_source),
         "total_lines": total_lines,
         "bad_lines": bad_lines,
         "camera_count": len(store.cameras),
@@ -897,7 +1163,7 @@ class OpenCvJsonlViewer:
         self,
         root: tk.Tk,
         video_dir: Path,
-        frame_image_dir: Path,
+        frame_image_dir: Any,
         store: AnnotationStore,
         initial_camera: int,
     ):
@@ -912,13 +1178,18 @@ class OpenCvJsonlViewer:
         self.canvas_image_id: int | None = None
         self.camera_box: ttk.Combobox | None = None
         self.choose_media_dir_button: ttk.Button | None = None
-        self.current_jsonl_path = (
-            Path(self.store.summary.get("jsonl_path", JSONL_PATH))
-            .expanduser()
-            .resolve()
+        self.cancel_jsonl_load_button: ttk.Button | None = None
+        self.json_sidebar_button: ttk.Button | None = None
+        self.body_pane: ttk.PanedWindow | None = None
+        self.right_panel: ttk.Frame | None = None
+        self.json_sidebar_visible = False
+        self.current_jsonl_path = resource_to_text(
+            self.store.summary.get("jsonl_path", JSONL_PATH)
         )
         self.jsonl_load_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.jsonl_loading = False
+        self.jsonl_load_token = 0
+        self.jsonl_cancel_event: threading.Event | None = None
         self.video_keyframe_indexes: dict[int, VideoKeyframeIndex] = {}
         self.video_readers: dict[int, PyAvVideoFrameReader] = {}
         self.video_frame_cache: dict[int, Any] = {}
@@ -937,6 +1208,18 @@ class OpenCvJsonlViewer:
         self.video_cache_max_frames = VIDEO_CACHE_MAX_FRAMES
         self.video_prefetch_after = VIDEO_PREFETCH_AFTER
         self.video_prefetch_target_ahead = VIDEO_PREFETCH_TARGET_AHEAD
+        self.image_frame_cache: dict[tuple[int, int], Any] = {}
+        self.image_prefetch_pending: set[tuple[int, int]] = set()
+        self.image_prefetch_token = 0
+        self.image_prefetching = False
+        self.image_prefetch_camera: int | None = None
+        self.image_prefetch_center_index: int | None = None
+        self.image_prefetch_target_index: int | None = None
+        self.image_pending_render_index: int | None = None
+        self.image_prefetch_before = IMAGE_PREFETCH_BEFORE
+        self.image_prefetch_after = IMAGE_PREFETCH_AFTER
+        self.image_cache_max_frames = IMAGE_CACHE_MAX_FRAMES
+        self.image_prefetch_widgets: list[tk.Widget] = []
         self.json_offset_frames = 0
         self.is_updating_progress = False
         self.is_playing = False
@@ -953,6 +1236,9 @@ class OpenCvJsonlViewer:
         self.status_var = tk.StringVar(value="")
         self.cache_status_var = tk.StringVar(value="缓冲：未启用")
         self.cache_target_var = tk.StringVar(value=str(VIDEO_PREFETCH_TARGET_AHEAD))
+        self.image_prefetch_before_var = tk.StringVar(value=str(IMAGE_PREFETCH_BEFORE))
+        self.image_prefetch_after_var = tk.StringVar(value=str(IMAGE_PREFETCH_AFTER))
+        self.image_cache_max_var = tk.StringVar(value=str(IMAGE_CACHE_MAX_FRAMES))
         self.display_width_var = tk.StringVar(value=str(DISPLAY_WIDTH))
         self.display_height_var = tk.StringVar(value=str(DISPLAY_HEIGHT))
         self.video_scale_var = tk.DoubleVar(value=DEFAULT_VIDEO_SCALE)
@@ -1015,7 +1301,7 @@ class OpenCvJsonlViewer:
         status_row.grid(row=5, column=0, sticky="ew", pady=(6, 0))
         status_row.columnconfigure(0, weight=1)
 
-        row1.columnconfigure(17, weight=1)
+        row1.columnconfigure(19, weight=1)
         row2.columnconfigure(16, weight=1)
         row3.columnconfigure(16, weight=1)
         progress_row.columnconfigure(1, weight=1)
@@ -1086,6 +1372,19 @@ class OpenCvJsonlViewer:
         ttk.Button(row1, text="加载预设资源", command=self.load_preset_resources).grid(
             row=0, column=16, padx=4
         )
+        self.cancel_jsonl_load_button = ttk.Button(
+            row1,
+            text="取消加载",
+            command=self.cancel_jsonl_load,
+            state=tk.DISABLED,
+        )
+        self.cancel_jsonl_load_button.grid(row=0, column=17, padx=4)
+        self.json_sidebar_button = ttk.Button(
+            row1,
+            text="展开JSON",
+            command=self.toggle_json_sidebar,
+        )
+        self.json_sidebar_button.grid(row=0, column=18, padx=4)
 
         ttk.Checkbutton(
             row2,
@@ -1248,15 +1547,52 @@ class OpenCvJsonlViewer:
         ttk.Label(status_row, textvariable=self.cache_status_var, anchor="w").grid(
             row=0, column=5, sticky="w"
         )
+        image_separator = ttk.Separator(status_row, orient=tk.VERTICAL)
+        image_separator.grid(row=0, column=6, sticky="ns", padx=8)
+        image_before_label = ttk.Label(status_row, text="图片预载前")
+        image_before_label.grid(row=0, column=7, padx=(0, 4))
+        image_before_entry = ttk.Entry(
+            status_row, width=5, textvariable=self.image_prefetch_before_var
+        )
+        image_before_entry.grid(row=0, column=8, padx=(0, 4))
+        image_after_label = ttk.Label(status_row, text="后")
+        image_after_label.grid(row=0, column=9, padx=(4, 4))
+        image_after_entry = ttk.Entry(
+            status_row, width=5, textvariable=self.image_prefetch_after_var
+        )
+        image_after_entry.grid(row=0, column=10, padx=(0, 4))
+        image_max_label = ttk.Label(status_row, text="上限")
+        image_max_label.grid(row=0, column=11, padx=(4, 4))
+        image_max_entry = ttk.Entry(
+            status_row, width=6, textvariable=self.image_cache_max_var
+        )
+        image_max_entry.grid(row=0, column=12, padx=(0, 4))
+        image_apply_button = ttk.Button(
+            status_row, text="应用图片预载", command=self.apply_image_prefetch_range
+        )
+        image_apply_button.grid(row=0, column=13, padx=(0, 8))
+        for entry in [image_before_entry, image_after_entry, image_max_entry]:
+            entry.bind("<Return>", lambda _event: self.apply_image_prefetch_range())
+        self.image_prefetch_widgets = [
+            image_separator,
+            image_before_label,
+            image_before_entry,
+            image_after_label,
+            image_after_entry,
+            image_max_label,
+            image_max_entry,
+            image_apply_button,
+        ]
+        self.update_image_prefetch_controls()
         self.update_label_option_state()
 
-        body = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        body.grid(row=1, column=0, sticky="nsew")
+        self.body_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.body_pane.grid(row=1, column=0, sticky="nsew")
 
-        left = ttk.Frame(body, padding=8)
-        right = ttk.Frame(body, padding=8)
-        body.add(left, weight=3)
-        body.add(right, weight=2)
+        left = ttk.Frame(self.body_pane, padding=8)
+        right = ttk.Frame(self.body_pane, padding=8)
+        self.right_panel = right
+        self.body_pane.add(left, weight=3)
 
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
@@ -1317,6 +1653,20 @@ class OpenCvJsonlViewer:
         self.root.bind("q", lambda _event: self.root.destroy())
         self.update_choose_dir_button_label()
 
+    def toggle_json_sidebar(self) -> None:
+        if self.body_pane is None or self.right_panel is None:
+            return
+        if self.json_sidebar_visible:
+            self.body_pane.forget(self.right_panel)
+            self.json_sidebar_visible = False
+            if self.json_sidebar_button is not None:
+                self.json_sidebar_button.configure(text="展开JSON")
+        else:
+            self.body_pane.add(self.right_panel, weight=2)
+            self.json_sidebar_visible = True
+            if self.json_sidebar_button is not None:
+                self.json_sidebar_button.configure(text="收起JSON")
+
     def update_choose_dir_button_label(self) -> None:
         if self.choose_media_dir_button is None:
             return
@@ -1336,35 +1686,47 @@ class OpenCvJsonlViewer:
 
     def choose_media_dir(self) -> None:
         if self.is_video_mode():
+            initial_value = resource_to_text(self.video_dir)
             initialdir = self.video_dir if self.video_dir.is_dir() else PROJECT_DIR
             dialog_title = "选择视频目录"
         else:
-            initialdir = (
-                self.frame_image_dir if self.frame_image_dir.is_dir() else PROJECT_DIR
+            initial_value = resource_to_text(self.frame_image_dir)
+            local_image_dir = (
+                local_path_from_resource(self.frame_image_dir)
+                if not is_remote_resource(self.frame_image_dir)
+                else PROJECT_DIR
             )
+            initialdir = local_image_dir if local_image_dir.is_dir() else PROJECT_DIR
             dialog_title = "选择图片目录"
 
-        selected = filedialog.askdirectory(
-            title=dialog_title,
-            initialdir=str(initialdir),
+        dialog = ResourceDirectoryDialog(
+            self.root,
+            dialog_title,
+            initial_value,
+            initialdir,
         )
-        if not selected:
+        if dialog.result is None:
             return
+        selected_resource = normalize_local_or_remote_resource(dialog.result)
 
         self.is_playing = False
-        selected_path = Path(selected).expanduser().resolve()
         current_pts = self.current_display_pts()
 
         if self.is_video_mode():
+            if is_remote_resource(selected_resource):
+                messagebox.showerror("暂不支持", "视频模式目前只支持本地视频目录")
+                return
             self.cancel_video_task()
             self.clear_video_cache()
             self.close_video_readers()
             self.video_keyframe_indexes.clear()
-            self.video_dir = selected_path
+            self.video_dir = local_path_from_resource(selected_resource).resolve()
             self.status_var.set(f"已切换视频目录：{self.video_dir}")
         else:
-            self.frame_image_dir = selected_path
+            self.frame_image_dir = selected_resource
+            self.clear_image_cache()
             self.status_var.set(f"已切换图片目录：{self.frame_image_dir}")
+        self.update_image_prefetch_controls()
 
         if not self.store.cameras:
             if messagebox.askyesno(
@@ -1379,23 +1741,29 @@ class OpenCvJsonlViewer:
         if self.jsonl_loading:
             messagebox.showinfo("正在加载", "JSONL 正在加载中，请稍候")
             return
-        selected = filedialog.askopenfilename(
-            title="选择 JSONL 文件",
-            initialdir=str(PROJECT_DIR),
-            filetypes=[
-                ("JSONL 文件", "*.jsonl"),
-                ("JSON 文件", "*.json"),
-                ("所有文件", "*.*"),
-            ],
-        )
-        if not selected:
-            return
 
-        selected_path = Path(selected).expanduser().resolve()
-        if not selected_path.is_file():
-            messagebox.showerror("文件不存在", f"找不到文件：{selected_path}")
+        if is_remote_resource(self.current_jsonl_path):
+            initialdir = PROJECT_DIR
+        else:
+            current_path = local_path_from_resource(self.current_jsonl_path)
+            initialdir = current_path.parent if current_path.parent.is_dir() else PROJECT_DIR
+
+        dialog = ResourceFileDialog(
+            self.root,
+            "选择 JSONL",
+            self.current_jsonl_path,
+            initialdir,
+        )
+        if dialog.result is None:
             return
-        self.start_jsonl_load(selected_path)
+        selected_resource = normalize_local_or_remote_resource(
+            dialog.result, must_be_file=True
+        )
+
+        if not is_remote_resource(selected_resource) and not Path(selected_resource).is_file():
+            messagebox.showerror("文件不存在", f"找不到文件：{selected_resource}")
+            return
+        self.start_jsonl_load(selected_resource)
 
     def load_preset_resources(self) -> None:
         if self.jsonl_loading:
@@ -1403,10 +1771,10 @@ class OpenCvJsonlViewer:
             return
         args = parse_args()
         video_dir = args.video_dir.expanduser().resolve()
-        frame_image_dir = args.frame_image_dir.expanduser().resolve()
-        jsonl_path = args.jsonl.expanduser().resolve()
+        frame_image_dir = normalize_local_or_remote_resource(args.frame_image_dir)
+        jsonl_path = normalize_local_or_remote_resource(args.jsonl, must_be_file=True)
 
-        if not jsonl_path.is_file():
+        if not is_remote_resource(jsonl_path) and not Path(jsonl_path).is_file():
             messagebox.showerror(
                 "预设资源加载失败", f"找不到预设 JSONL 文件：\n{jsonl_path}"
             )
@@ -1416,44 +1784,89 @@ class OpenCvJsonlViewer:
         self.frame_image_dir = frame_image_dir
         self.start_jsonl_load(jsonl_path, preset_camera=args.camera)
 
+    def update_jsonl_load_button_state(self) -> None:
+        if self.cancel_jsonl_load_button is None:
+            return
+        state = tk.NORMAL if self.jsonl_loading else tk.DISABLED
+        self.cancel_jsonl_load_button.configure(state=state)
+
+    def cancel_jsonl_load(self) -> None:
+        if not self.jsonl_loading:
+            return
+        if self.jsonl_cancel_event is not None:
+            self.jsonl_cancel_event.set()
+        self.jsonl_load_token += 1
+        self.jsonl_loading = False
+        self.update_jsonl_load_button_state()
+        self.status_var.set("JSONL 加载已取消")
+
     def start_jsonl_load(
-        self, jsonl_path: Path, preset_camera: int | None = None
+        self, jsonl_path: Any, preset_camera: int | None = None
     ) -> None:
         self.is_playing = False
+        if self.jsonl_cancel_event is not None:
+            self.jsonl_cancel_event.set()
+        self.jsonl_load_token += 1
+        token = self.jsonl_load_token
+        cancel_event = threading.Event()
+        self.jsonl_cancel_event = cancel_event
         self.jsonl_loading = True
-        self.status_var.set(f"正在加载 JSONL：{jsonl_path.name} ...")
+        jsonl_source = normalize_local_or_remote_resource(jsonl_path, must_be_file=True)
+        self.status_var.set(f"正在加载 JSONL：{display_resource_name(jsonl_source)} ...")
+        self.update_jsonl_load_button_state()
 
         def progress_cb(pct: int, lines: int, cameras: int) -> None:
             self.jsonl_load_queue.put(
                 {
                     "kind": "progress",
+                    "token": token,
                     "pct": pct,
                     "lines": lines,
                     "cameras": cameras,
-                    "path": str(jsonl_path),
+                    "path": str(jsonl_source),
                 }
             )
 
         def worker() -> None:
             try:
-                new_store = load_annotations(jsonl_path, progress_callback=progress_cb)
+                new_store = load_annotations(
+                    jsonl_source,
+                    progress_callback=progress_cb,
+                    cancel_event=cancel_event,
+                )
                 self.jsonl_load_queue.put(
                     {
                         "kind": "done",
+                        "token": token,
                         "store": new_store,
-                        "path": jsonl_path,
+                        "path": jsonl_source,
                         "preset_camera": preset_camera,
                         "error": None,
+                        "cancelled": False,
+                    }
+                )
+            except JsonlLoadCancelled:
+                self.jsonl_load_queue.put(
+                    {
+                        "kind": "done",
+                        "token": token,
+                        "store": None,
+                        "path": jsonl_source,
+                        "preset_camera": preset_camera,
+                        "error": None,
+                        "cancelled": True,
                     }
                 )
             except Exception as exc:
                 self.jsonl_load_queue.put(
                     {
                         "kind": "done",
+                        "token": token,
                         "store": None,
-                        "path": jsonl_path,
+                        "path": jsonl_source,
                         "preset_camera": preset_camera,
                         "error": str(exc),
+                        "cancelled": False,
                     }
                 )
 
@@ -1464,13 +1877,15 @@ class OpenCvJsonlViewer:
         try:
             while True:
                 result = self.jsonl_load_queue.get_nowait()
+                if result.get("token") != self.jsonl_load_token:
+                    continue
                 kind = result.get("kind")
                 if kind == "progress":
                     pct = result["pct"]
                     lines = result["lines"]
                     cameras = result["cameras"]
                     path = result["path"]
-                    name = Path(path).name
+                    name = display_resource_name(path)
                     self.status_var.set(
                         f"正在加载 JSONL：{name} | {pct}% | {lines} 行 | {cameras} 路相机"
                     )
@@ -1483,7 +1898,14 @@ class OpenCvJsonlViewer:
             self.root.after(100, self.process_jsonl_load_results)
 
     def handle_jsonl_load_done(self, result: dict[str, Any]) -> None:
+        if result.get("token") != self.jsonl_load_token:
+            return
         self.jsonl_loading = False
+        self.jsonl_cancel_event = None
+        self.update_jsonl_load_button_state()
+        if result.get("cancelled"):
+            self.status_var.set("JSONL 加载已取消")
+            return
         error = result.get("error")
         new_store = result.get("store")
         jsonl_path = result.get("path")
@@ -1500,10 +1922,11 @@ class OpenCvJsonlViewer:
 
         self.cancel_video_task()
         self.clear_video_cache()
+        self.clear_image_cache()
         self.close_video_readers()
         self.video_keyframe_indexes.clear()
         self.store = new_store
-        self.current_jsonl_path = jsonl_path
+        self.current_jsonl_path = resource_to_text(jsonl_path)
         self.refresh_camera_choices()
 
         current_camera = self.current_camera
@@ -1520,11 +1943,12 @@ class OpenCvJsonlViewer:
 
         summary = new_store.summary
         self.status_var.set(
-            f"JSONL 加载完成：{Path(str(jsonl_path)).name} | "
+            f"JSONL 加载完成：{display_resource_name(jsonl_path)} | "
             f"{summary.get('total_lines', 0)} 行 | "
             f"{summary.get('camera_count', 0)} 路相机"
         )
         self.open_camera(camera_id)
+        self.schedule_image_prefetch()
 
     def clear_video_cache(self) -> None:
         self.video_frame_cache.clear()
@@ -1566,6 +1990,64 @@ class OpenCvJsonlViewer:
 
     def update_cache_status(self) -> None:
         if not hasattr(self, "cache_status_var"):
+            return
+        if self.is_network_image_mode():
+            cached_count = sum(
+                1 for camera_id, _idx in self.image_frame_cache if camera_id == self.current_camera
+            )
+            pending_count = sum(
+                1
+                for camera_id, _idx in self.image_prefetch_pending
+                if camera_id == self.current_camera
+            )
+            total_target = self.image_prefetch_before + self.image_prefetch_after + 1
+            target_index = (
+                self.image_prefetch_target_index
+                if self.image_prefetch_target_index is not None
+                else self.current_index
+            )
+            window_cached = 0
+            ahead_cached = 0
+            try:
+                annotation = self.get_annotation()
+            except KeyError:
+                annotation = None
+            if annotation is not None and annotation.items:
+                target_index = max(0, min(target_index, len(annotation.items) - 1))
+                start_index = max(0, target_index - self.image_prefetch_before)
+                end_index = min(
+                    len(annotation.items) - 1,
+                    target_index + self.image_prefetch_after,
+                )
+                window_cached = sum(
+                    1
+                    for idx in range(start_index, end_index + 1)
+                    if (self.current_camera, idx) in self.image_frame_cache
+                )
+                probe = max(0, min(self.current_index + 1, len(annotation.items) - 1))
+                while (
+                    probe < len(annotation.items)
+                    and (self.current_camera, probe) in self.image_frame_cache
+                ):
+                    ahead_cached += 1
+                    probe += 1
+            parts = [
+                f"网络图片已缓存 {cached_count}/{self.image_cache_max_frames} 帧",
+                f"当前窗口 {window_cached}/{total_target}",
+                f"前向连续 {ahead_cached}",
+                f"待下载 {pending_count}",
+                f"范围 前{self.image_prefetch_before}/后{self.image_prefetch_after}",
+            ]
+            if self.image_prefetching:
+                parts.append(
+                    f"预取中(中心帧 {self.image_prefetch_center_index + 1 if self.image_prefetch_center_index is not None else '?'})"
+                )
+            else:
+                parts.append("空闲")
+            if self.image_prefetch_target_index is not None:
+                parts.append(f"目标帧 {self.image_prefetch_target_index + 1}")
+            parts.append(f"目标 {total_target} 帧")
+            self.cache_status_var.set("缓冲：" + " | ".join(parts))
             return
         if not self.is_video_mode():
             self.cache_status_var.set("缓冲：图片模式不启用")
@@ -1613,6 +2095,296 @@ class OpenCvJsonlViewer:
         )
         self.update_cache_status()
         self.maybe_prefetch_video()
+
+    def is_network_image_mode(self) -> bool:
+        return (not self.is_video_mode()) and is_remote_resource(self.frame_image_dir)
+
+    def update_image_prefetch_controls(self) -> None:
+        visible = self.is_network_image_mode()
+        for widget in self.image_prefetch_widgets:
+            if visible:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        self.update_cache_status()
+        if visible:
+            self.schedule_image_prefetch()
+
+    def schedule_image_prefetch(self) -> None:
+        if self.is_network_image_mode() and self.store.cameras:
+            self.root.after(0, lambda: self.maybe_prefetch_image_frames(self.current_index))
+
+    def apply_image_prefetch_range(self) -> None:
+        try:
+            before = int(self.image_prefetch_before_var.get())
+            after = int(self.image_prefetch_after_var.get())
+            max_frames = int(self.image_cache_max_var.get())
+        except ValueError:
+            messagebox.showerror("输入错误", "图片预载范围和缓存上限必须是整数")
+            return
+
+        if before < 0 or after < 0:
+            messagebox.showerror("输入错误", "图片预载范围不能小于 0")
+            return
+        if max_frames < 1:
+            messagebox.showerror("输入错误", "图片缓存上限至少 1 帧")
+            return
+        if before > 1000 or after > 1000:
+            messagebox.showerror("输入错误", "图片预载范围过大，建议不超过 1000")
+            return
+        if max_frames > 4096:
+            messagebox.showerror("输入错误", "图片缓存上限过大，建议不超过 4096")
+            return
+
+        self.image_prefetch_before = before
+        self.image_prefetch_after = after
+        self.image_cache_max_frames = max(max_frames, before + after + 1)
+        self.image_prefetch_before_var.set(str(before))
+        self.image_prefetch_after_var.set(str(after))
+        self.image_cache_max_var.set(str(self.image_cache_max_frames))
+        self.trim_image_cache_to_limit()
+        self.update_cache_status()
+        self.maybe_prefetch_image_frames(self.current_index)
+
+    def clear_image_cache(self) -> None:
+        self.image_frame_cache.clear()
+        self.image_prefetch_pending.clear()
+        self.image_pending_render_index = None
+        self.cancel_image_prefetch_task()
+        self.update_cache_status()
+
+    def clear_current_camera_image_cache(self) -> None:
+        for key in list(self.image_frame_cache):
+            if key[0] == self.current_camera:
+                del self.image_frame_cache[key]
+        for key in list(self.image_prefetch_pending):
+            if key[0] == self.current_camera:
+                self.image_prefetch_pending.remove(key)
+        self.update_cache_status()
+
+    def trim_image_cache_to_limit(self, center_index: int | None = None) -> None:
+        if center_index is None:
+            center_index = self.current_index
+        max_frames = max(1, self.image_cache_max_frames)
+        if len(self.image_frame_cache) <= max_frames:
+            return
+
+        def eviction_score(key: tuple[int, int]) -> tuple[int, int]:
+            camera_id, frame_index = key
+            different_camera = 1 if camera_id != self.current_camera else 0
+            return different_camera, abs(frame_index - center_index)
+
+        keys_by_distance = sorted(
+            self.image_frame_cache,
+            key=eviction_score,
+            reverse=True,
+        )
+        for key in keys_by_distance:
+            if len(self.image_frame_cache) <= max_frames:
+                break
+            del self.image_frame_cache[key]
+
+    def cancel_image_prefetch_task(self) -> None:
+        self.image_prefetch_token += 1
+        self.image_prefetching = False
+        self.image_prefetch_camera = None
+        self.image_prefetch_center_index = None
+        self.image_prefetch_target_index = None
+        self.image_prefetch_pending.clear()
+
+    def start_image_prefetch_task(self, camera_id: int, center_index: int) -> int:
+        self.image_prefetch_token += 1
+        self.image_prefetching = True
+        self.image_prefetch_camera = camera_id
+        self.image_prefetch_center_index = center_index
+        self.update_cache_status()
+        return self.image_prefetch_token
+
+    def finish_image_prefetch_task(self, token: int) -> bool:
+        if token != self.image_prefetch_token:
+            return False
+        self.image_prefetching = False
+        self.image_prefetch_camera = None
+        self.image_prefetch_center_index = None
+        self.update_cache_status()
+        return True
+
+    def is_image_prefetch_current(self, token: int, camera_id: int) -> bool:
+        return (
+            token == self.image_prefetch_token
+            and camera_id == self.current_camera
+        )
+
+    def image_resource_for_frame(self, camera_id: int, pts: int) -> Any:
+        return join_resource(self.frame_image_dir, str(camera_id), f"{pts}.jpg")
+
+    def fetch_remote_image_frame(self, image_resource: Any) -> Any | None:
+        image_bytes = read_remote_bytes(image_resource)
+        return decode_image_bytes(image_bytes)
+
+    def maybe_prefetch_image_frames(self, center_index: int) -> None:
+        if not self.is_network_image_mode():
+            return
+        try:
+            annotation = self.get_annotation()
+        except KeyError:
+            return
+        if not annotation.items:
+            return
+
+        center_index = max(0, min(center_index, len(annotation.items) - 1))
+        start_index = max(0, center_index - self.image_prefetch_before)
+        end_index = min(len(annotation.items) - 1, center_index + self.image_prefetch_after)
+        camera_id = self.current_camera
+        cached_indices = [
+            idx for cached_camera, idx in self.image_frame_cache if cached_camera == camera_id
+        ]
+        has_window_overlap = any(start_index <= idx <= end_index for idx in cached_indices)
+        if cached_indices and not has_window_overlap:
+            self.cancel_image_prefetch_task()
+            self.clear_current_camera_image_cache()
+        self.image_prefetch_target_index = center_index
+        missing_indices = [
+            idx
+            for idx in range(start_index, end_index + 1)
+            if (camera_id, idx) not in self.image_frame_cache
+            and (camera_id, idx) not in self.image_prefetch_pending
+        ]
+        missing_indices.sort(key=lambda idx: (0 if idx >= center_index else 1, abs(idx - center_index)))
+        if not missing_indices:
+            self.trim_image_cache_to_limit(center_index)
+            self.update_cache_status()
+            return
+        if self.image_prefetching:
+            self.update_cache_status()
+            return
+
+        frame_image_dir = self.frame_image_dir
+        pts_values = annotation.pts_values
+        token = self.start_image_prefetch_task(camera_id, center_index)
+        pending_keys = {(camera_id, idx) for idx in missing_indices}
+        self.image_prefetch_pending.update(pending_keys)
+        self.update_cache_status()
+
+        def worker() -> None:
+            errors = 0
+            for idx in missing_indices:
+                if not self.is_image_prefetch_current(token, camera_id):
+                    self.video_result_queue.put(
+                        {
+                            "kind": "image_prefetch",
+                            "token": token,
+                            "camera_id": camera_id,
+                            "center_index": center_index,
+                            "pending_keys": pending_keys,
+                            "errors": errors,
+                            "cancelled": True,
+                        }
+                    )
+                    return
+                pts = pts_values[idx]
+                image_resource = join_resource(frame_image_dir, str(camera_id), f"{pts}.jpg")
+                try:
+                    frame = self.fetch_remote_image_frame(image_resource)
+                except Exception:
+                    errors += 1
+                    self.video_result_queue.put(
+                        {
+                            "kind": "image_frame",
+                            "token": token,
+                            "camera_id": camera_id,
+                            "frame_index": idx,
+                            "center_index": center_index,
+                            "frame": None,
+                            "error": True,
+                        }
+                    )
+                    continue
+                if frame is not None:
+                    self.video_result_queue.put(
+                        {
+                            "kind": "image_frame",
+                            "token": token,
+                            "camera_id": camera_id,
+                            "frame_index": idx,
+                            "center_index": center_index,
+                            "frame": frame,
+                            "error": False,
+                        }
+                    )
+                else:
+                    errors += 1
+                    self.video_result_queue.put(
+                        {
+                            "kind": "image_frame",
+                            "token": token,
+                            "camera_id": camera_id,
+                            "frame_index": idx,
+                            "center_index": center_index,
+                            "frame": None,
+                            "error": True,
+                        }
+                    )
+
+            self.video_result_queue.put(
+                {
+                    "kind": "image_prefetch",
+                    "token": token,
+                    "camera_id": camera_id,
+                    "center_index": center_index,
+                    "pending_keys": pending_keys,
+                    "errors": errors,
+                    "cancelled": False,
+                }
+            )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    def handle_image_frame_result(self, result: dict[str, Any]) -> None:
+        token = int(result["token"])
+        camera_id = int(result["camera_id"])
+        frame_index = int(result["frame_index"])
+        if not self.is_image_prefetch_current(token, camera_id):
+            return
+
+        key = (camera_id, frame_index)
+        self.image_prefetch_pending.discard(key)
+        frame = result.get("frame")
+        if frame is not None:
+            self.image_frame_cache[key] = frame
+            self.trim_image_cache_to_limit(
+                self.image_prefetch_target_index
+                if self.image_prefetch_target_index is not None
+                else frame_index
+            )
+            if (
+                self.image_pending_render_index == frame_index
+                and camera_id == self.current_camera
+            ):
+                self.current_index = frame_index
+                self.current_raw_frame = frame
+                self.image_pending_render_index = None
+                self.render_frame(frame)
+        self.update_cache_status()
+
+    def handle_image_prefetch_result(self, result: dict[str, Any]) -> None:
+        token = int(result["token"])
+        camera_id = int(result["camera_id"])
+        center_index = int(result["center_index"])
+        if not self.is_image_prefetch_current(token, camera_id):
+            return
+        self.finish_image_prefetch_task(token)
+        pending_keys = result.get("pending_keys") or set()
+        self.image_prefetch_pending.difference_update(pending_keys)
+        self.trim_image_cache_to_limit(center_index)
+        self.update_cache_status()
+        next_target = (
+            self.image_prefetch_target_index
+            if self.image_prefetch_target_index is not None
+            else self.current_index
+        )
+        self.maybe_prefetch_image_frames(next_target)
 
     def close_video_readers(self) -> None:
         for reader in self.video_readers.values():
@@ -1694,6 +2466,10 @@ class OpenCvJsonlViewer:
                     self.handle_main_video_result(result)
                 elif kind == "prefetch":
                     self.handle_prefetch_video_result(result)
+                elif kind == "image_frame":
+                    self.handle_image_frame_result(result)
+                elif kind == "image_prefetch":
+                    self.handle_image_prefetch_result(result)
         except queue.Empty:
             pass
 
@@ -1738,6 +2514,7 @@ class OpenCvJsonlViewer:
         self.current_index = frame_index
         self.current_raw_frame = frame
         self.render_frame(frame)
+        self.maybe_prefetch_image_frames(frame_index)
         self.maybe_prefetch_video()
 
     def handle_prefetch_video_result(self, result: dict[str, Any]) -> None:
@@ -2038,7 +2815,9 @@ class OpenCvJsonlViewer:
         self.current_camera = camera_id
         self.camera_var.set(str(camera_id))
         self.current_raw_frame = None
+        self.clear_image_cache()
         self.clear_video_cache()
+        self.update_image_prefetch_controls()
 
         if not self.is_video_mode():
             self.close_video_reader(camera_id)
@@ -2050,6 +2829,7 @@ class OpenCvJsonlViewer:
         else:
             frame_index = nearest_index_by_pts(annotation, target_pts)
         self.seek_and_render(frame_index)
+        self.schedule_image_prefetch()
 
     def is_video_mode(self) -> bool:
         return self.mode_var.get() == "视频模式"
@@ -2058,12 +2838,15 @@ class OpenCvJsonlViewer:
         self.is_playing = False
         self.current_raw_frame = None
         self.clear_video_cache()
+        self.clear_image_cache()
         if not self.is_video_mode():
             self.cancel_video_task()
             self.close_video_readers()
         self.update_choose_dir_button_label()
+        self.update_image_prefetch_controls()
         current_pts = self.current_display_pts()
         self.open_camera(self.current_camera, target_pts=current_pts)
+        self.schedule_image_prefetch()
 
     def change_camera(self) -> None:
         try:
@@ -2082,12 +2865,21 @@ class OpenCvJsonlViewer:
         if self.is_playing:
             self.last_tick_time = time.time()
             self.play_tick()
+        else:
+            self.maybe_prefetch_image_frames(self.current_index)
 
     def play_tick(self) -> None:
         if not self.is_playing:
             return
 
         next_index = self.current_index + 1
+        if self.is_network_image_mode():
+            annotation = self.get_annotation()
+            next_index = max(0, min(next_index, len(annotation.items) - 1))
+            if (self.current_camera, next_index) not in self.image_frame_cache:
+                self.maybe_prefetch_image_frames(next_index)
+                self.root.after(PLAY_INTERVAL_MS, self.play_tick)
+                return
         if self.video_loading and (
             not self.is_video_mode() or next_index not in self.video_frame_cache
         ):
@@ -2251,6 +3043,19 @@ class OpenCvJsonlViewer:
             self.seek_and_render_video_async(frame_index)
             return
 
+        if self.is_network_image_mode() and (
+            self.current_camera,
+            frame_index,
+        ) not in self.image_frame_cache:
+            self.image_pending_render_index = frame_index
+            self.maybe_prefetch_image_frames(frame_index)
+            pts = annotation.pts_values[frame_index]
+            self.status_var.set(
+                f"等待网络图片缓存：camera={self.current_camera}, frame={frame_index + 1}, pts={pts}"
+            )
+            self.update_cache_status()
+            return
+
         frame = self.read_frame_data(frame_index)
         if frame is None:
             self.status_var.set(
@@ -2279,7 +3084,47 @@ class OpenCvJsonlViewer:
     def read_image_frame(self, frame_index: int) -> Any | None:
         annotation = self.get_annotation()
         pts = annotation.pts_values[frame_index]
-        image_path = self.frame_image_dir / str(self.current_camera) / f"{pts}.jpg"
+        image_resource = join_resource(
+            self.frame_image_dir,
+            str(self.current_camera),
+            f"{pts}.jpg",
+        )
+
+        if is_remote_resource(image_resource):
+            cached_frame = self.image_frame_cache.get((self.current_camera, frame_index))
+            if cached_frame is not None:
+                return cached_frame
+            try:
+                frame = self.fetch_remote_image_frame(image_resource)
+            except Exception as exc:
+                self.show_json(
+                    {
+                        "error": "读取网络图片帧失败",
+                        "camera": self.current_camera,
+                        "frame_index": frame_index,
+                        "pts": pts,
+                        "url": resource_to_text(image_resource),
+                        "request_url": resource_to_request_url(image_resource),
+                        "exception": str(exc),
+                    }
+                )
+                return None
+            if frame is None:
+                self.show_json(
+                    {
+                        "error": "网络图片解码失败",
+                        "camera": self.current_camera,
+                        "frame_index": frame_index,
+                        "pts": pts,
+                        "url": resource_to_text(image_resource),
+                    }
+                )
+                return None
+            self.image_frame_cache[(self.current_camera, frame_index)] = frame
+            self.trim_image_cache_to_limit(frame_index)
+            return frame
+
+        image_path = Path(image_resource)
         if not image_path.is_file():
             self.show_json(
                 {
@@ -2452,6 +3297,9 @@ class OpenCvJsonlViewer:
         self.json_text.configure(state=tk.DISABLED)
 
     def close(self) -> None:
+        if self.jsonl_cancel_event is not None:
+            self.jsonl_cancel_event.set()
+        self.cancel_image_prefetch_task()
         self.cancel_video_task()
         self.close_video_readers()
         self.root.destroy()
@@ -2472,7 +3320,7 @@ def main() -> None:
         require_dependencies()
 
         video_dir = args.video_dir.expanduser().resolve()
-        frame_image_dir = args.frame_image_dir.expanduser().resolve()
+        frame_image_dir = normalize_local_or_remote_resource(args.frame_image_dir)
 
         store = AnnotationStore()
 
