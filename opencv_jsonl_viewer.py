@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+from copy import deepcopy
 import json
 import os
 import queue
@@ -19,7 +20,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -50,7 +51,7 @@ except ImportError:
 
 
 # =========================
-# 直接修改下面这些参数即可
+# 可修改下面这些参数
 # =========================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -60,10 +61,10 @@ PROJECT_DIR = SCRIPT_DIR.parent
 VIDEO_DIR = PROJECT_DIR / "videos" / "match_1_clip"
 
 # 2D pipeline 输出的 JSONL。
-JSONL_PATH = PROJECT_DIR / "output_0.jsonl"
+JSONL_PATH = "https://sense-omni.tos-cn-shanghai.volces.com/hocky/lym/data_saved/0526/output/jsonl_without_players/20260526_164647/output_0_no_players.jsonl"
 
 # 按 pts 命名的 JPEG 帧目录。
-FRAME_IMAGE_DIR = PROJECT_DIR / "videos" / "match_1_clip_jpeg_frames"
+FRAME_IMAGE_DIR = "https://sense-omni.tos-cn-shanghai.volces.com/hocky/lym/data_saved/0526/frame_clips/20260526_164647/"
 
 # 默认打开的相机。
 DEFAULT_CAMERA = 101
@@ -80,6 +81,7 @@ DEFAULT_LABEL_SCALE = 0.48
 
 # 自动播放时的刷新间隔，单位毫秒。30fps 约等于 33ms。
 PLAY_INTERVAL_MS = 33
+DEFAULT_FRAME_STEP = 1
 
 # 视频模式关键帧 seek 缓存。4K BGR 一帧约 24MB，不宜缓存太多。
 VIDEO_CACHE_BEFORE = 3
@@ -110,8 +112,15 @@ TEAM_COLORS_BGR = {
 }
 
 BALL_COLOR_BGR = (0, 220, 255)
+MANUAL_BALL_COLOR_BGR = (255, 0, 255)
 KEYPOINT_COLOR_BGR = (120, 255, 120)
 HEADER_TEXT_COLOR_BGR = (255, 255, 255)
+MANUAL_BALL_SOURCE = "manual"
+MANUAL_BALL_SCORE = 2.0
+ANNOTATION_WORK_SUFFIX = "_ball_annotation"
+MIN_ANNOTATION_BOX_SIZE = 3
+ANNOTATION_HIT_TOLERANCE = 6
+ANNOTATION_SAVE_DEBOUNCE_MS = 2000
 
 
 @dataclass
@@ -451,6 +460,91 @@ class ResourceFileDialog(simpledialog.Dialog):
         value = self.entry.get().strip()
         if not value:
             messagebox.showerror("输入错误", "JSONL 路径不能为空", parent=self)
+            return False
+        return True
+
+    def apply(self) -> None:
+        if self.entry is not None:
+            self.result = self.entry.get().strip()
+
+
+class AnnotationWorkPathDialog(simpledialog.Dialog):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        initial_value: str,
+        initialdir: Path,
+    ):
+        self.initial_value = initial_value
+        self.initialdir = initialdir
+        self.entry: ttk.Entry | None = None
+        self.result: str | None = None
+        super().__init__(parent, title)
+
+    def body(self, master: tk.Widget) -> tk.Widget:
+        ttk.Label(
+            master,
+            text=(
+                "输入标注 JSONL 文件路径可继续使用；输入或选择文件夹则会在该文件夹内"
+                "自动生成一份标注 JSONL。确认后才会开始写入。"
+            ),
+            anchor="w",
+            wraplength=720,
+        ).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        self.entry = ttk.Entry(master, width=92)
+        self.entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.entry.insert(0, self.initial_value)
+        master.columnconfigure(0, weight=1)
+        return self.entry
+
+    def buttonbox(self) -> None:
+        box = ttk.Frame(self)
+        ttk.Button(box, text="OK", width=10, command=self.ok).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+        ttk.Button(box, text="选择文件", width=12, command=self.choose_file).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+        ttk.Button(box, text="选择文件夹", width=12, command=self.choose_directory).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+        ttk.Button(box, text="取消", width=10, command=self.cancel).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+        self.bind("<Return>", self.ok)
+        self.bind("<Escape>", self.cancel)
+        box.pack()
+
+    def choose_file(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="选择已有标注 JSONL",
+            initialdir=str(self.initialdir),
+            filetypes=[("JSONL 文件", "*.jsonl"), ("所有文件", "*.*")],
+            parent=self,
+        )
+        if not selected or self.entry is None:
+            return
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, str(Path(selected).expanduser().resolve()))
+
+    def choose_directory(self) -> None:
+        selected = filedialog.askdirectory(
+            title="选择标注 JSONL 保存文件夹",
+            initialdir=str(self.initialdir),
+            parent=self,
+        )
+        if not selected or self.entry is None:
+            return
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, str(Path(selected).expanduser().resolve()))
+
+    def validate(self) -> bool:
+        if self.entry is None:
+            return False
+        value = self.entry.get().strip()
+        if not value:
+            messagebox.showerror("输入错误", "标注路径不能为空", parent=self)
             return False
         return True
 
@@ -1027,6 +1121,19 @@ def safe_score(value: Any) -> float:
         return 0.0
 
 
+def is_manual_ball(ball: dict[str, Any]) -> bool:
+    if ball.get("source") == MANUAL_BALL_SOURCE:
+        return True
+    try:
+        return float(ball.get("score")) == MANUAL_BALL_SCORE
+    except (TypeError, ValueError):
+        return False
+
+
+def ball_signature(ball: dict[str, Any]) -> str:
+    return json.dumps(ball, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def is_abnormal_player(player: dict[str, Any]) -> bool:
     return is_abnormal_player_with_thresholds(
         player,
@@ -1113,6 +1220,7 @@ def draw_detections(
     det_threshold: float,
     team_score_threshold: float,
     id_score_threshold: float,
+    deleted_ball_indices: set[int] | None = None,
 ) -> None:
     result, _result_missing = result_dict_from_item(item)
     box_thickness = max(1, int(round(label_scale * 3)))
@@ -1190,7 +1298,14 @@ def draw_detections(
 
     if show_balls:
         balls, _balls_state = detection_list_from_result(result, "balls")
+        original_ball_index = -1
+        deleted_ball_indices = deleted_ball_indices or set()
         for ball in balls:
+            if is_manual_ball(ball):
+                continue
+            original_ball_index += 1
+            if original_ball_index in deleted_ball_indices:
+                continue
             bbox_rect = scaled_bbox(ball.get("bbox"), scale_x, scale_y)
             if bbox_rect is None:
                 continue
@@ -1230,6 +1345,61 @@ def draw_detections(
             occupied_labels.append(rect)
 
 
+def draw_manual_ball_annotations(
+    frame: Any,
+    balls: list[dict[str, Any]],
+    scale_x: float,
+    scale_y: float,
+    label_scale: float,
+) -> None:
+    if not balls:
+        return
+
+    box_thickness = max(2, int(round(label_scale * 4)))
+    label_thickness = max(1, int(round(label_scale * 3)))
+    header_reserved_height = max(34, int(round(56 * label_scale)))
+    occupied_labels: list[tuple[int, int, int, int]] = [
+        (0, 0, int(frame.shape[1] * 0.72), header_reserved_height)
+    ]
+
+    for index, ball in enumerate(balls, start=1):
+        bbox_rect = scaled_bbox(ball.get("bbox"), scale_x, scale_y)
+        if bbox_rect is None:
+            continue
+
+        x1, y1, x2, y2 = bbox_rect
+        cv2.rectangle(
+            frame, (x1, y1), (x2, y2), MANUAL_BALL_COLOR_BGR, box_thickness
+        )
+        label = f"manual ball {index}"
+        label_x, label_y = find_label_position(
+            frame,
+            label,
+            (x1, y1, x2, y2),
+            occupied_labels,
+            label_scale,
+            label_thickness,
+        )
+        rect = text_rect(frame, label, label_x, label_y, label_scale, label_thickness)
+        draw_leader_line(
+            frame,
+            (x1, y1, x2, y2),
+            rect,
+            MANUAL_BALL_COLOR_BGR,
+            max(1, label_thickness),
+        )
+        rect = draw_label(
+            frame,
+            label,
+            label_x,
+            label_y,
+            MANUAL_BALL_COLOR_BGR,
+            font_scale=label_scale,
+            thickness=label_thickness,
+        )
+        occupied_labels.append(rect)
+
+
 class OpenCvJsonlViewer:
     def __init__(
         self,
@@ -1252,6 +1422,12 @@ class OpenCvJsonlViewer:
         self.choose_media_dir_button: ttk.Button | None = None
         self.cancel_jsonl_load_button: ttk.Button | None = None
         self.json_sidebar_button: ttk.Button | None = None
+        self.annotation_mode_button: ttk.Button | None = None
+        self.annotation_path_button: ttk.Button | None = None
+        self.save_annotation_button: ttk.Button | None = None
+        self.undo_annotation_button: ttk.Button | None = None
+        self.clear_annotation_button: ttk.Button | None = None
+        self.restore_original_ball_button: ttk.Button | None = None
         self.body_pane: ttk.PanedWindow | None = None
         self.right_panel: ttk.Frame | None = None
         self.json_sidebar_visible = False
@@ -1292,6 +1468,28 @@ class OpenCvJsonlViewer:
         self.image_prefetch_after = IMAGE_PREFETCH_AFTER
         self.image_cache_max_frames = IMAGE_CACHE_MAX_FRAMES
         self.image_prefetch_widgets: list[tk.Widget] = []
+        self.manual_ball_annotations: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        self.deleted_original_ball_indices: dict[tuple[int, int], set[int]] = {}
+        self.deleted_original_ball_history: dict[tuple[int, int], list[int]] = {}
+        self.annotation_output_lines: list[str] = []
+        self.annotation_key_to_output_indices: dict[tuple[int, int], list[int]] = {}
+        self.annotation_output_entries: list[tuple[int, dict[str, Any]]] = []
+        self.annotation_mode_enabled = False
+        self.annotation_work_path: Path | None = None
+        self.annotation_loaded_path: Path | None = None
+        self.annotation_io_token = 0
+        self.annotation_io_running = False
+        self.annotation_dirty = False
+        self.annotation_dirty_version = 0
+        self.annotation_last_saved_version = 0
+        self.annotation_save_after_id: str | None = None
+        self.annotation_saving = False
+        self.close_after_annotation_save = False
+        self.pending_after_annotation_save: tuple[str, tuple[Any, ...]] | None = None
+        self.annotation_write_lock = threading.Lock()
+        self.annotation_save_error: str | None = None
+        self.annotation_drag_start: tuple[float, float] | None = None
+        self.annotation_preview_rect_id: int | None = None
         self.json_offset_frames = 0
         self.is_updating_progress = False
         self.is_playing = False
@@ -1303,10 +1501,12 @@ class OpenCvJsonlViewer:
         self.mode_var = tk.StringVar(value="图片模式")
         self.pts_var = tk.StringVar(value="")
         self.frame_var = tk.StringVar(value="1")
+        self.frame_step_var = tk.StringVar(value=str(DEFAULT_FRAME_STEP))
         self.progress_var = tk.DoubleVar(value=1)
         self.json_offset_var = tk.StringVar(value="0")
         self.status_var = tk.StringVar(value="")
         self.cache_status_var = tk.StringVar(value="缓冲：未启用")
+        self.annotation_save_mode_var = tk.StringVar(value="自动保存")
         self.cache_target_var = tk.StringVar(value=str(VIDEO_PREFETCH_TARGET_AHEAD))
         self.image_prefetch_before_var = tk.StringVar(value=str(IMAGE_PREFETCH_BEFORE))
         self.image_prefetch_after_var = tk.StringVar(value=str(IMAGE_PREFETCH_AFTER))
@@ -1361,19 +1561,25 @@ class OpenCvJsonlViewer:
 
         row1 = ttk.Frame(toolbar)
         row1.grid(row=0, column=0, sticky="ew")
+        resource_row = ttk.Frame(toolbar)
+        resource_row.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         row2 = ttk.Frame(toolbar)
-        row2.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        row2.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         row3 = ttk.Frame(toolbar)
-        row3.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        row3.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         progress_row = ttk.Frame(toolbar)
-        progress_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        progress_row.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         self.threshold_row = ttk.Frame(toolbar)
-        self.threshold_row.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        self.threshold_row.grid(row=5, column=0, sticky="ew", pady=(6, 0))
         status_row = ttk.Frame(toolbar)
-        status_row.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+        status_row.grid(row=6, column=0, sticky="ew", pady=(6, 0))
+        cache_row = ttk.Frame(toolbar)
+        cache_row.grid(row=7, column=0, sticky="ew", pady=(6, 0))
         status_row.columnconfigure(0, weight=1)
+        cache_row.columnconfigure(5, weight=1)
 
-        row1.columnconfigure(19, weight=1)
+        row1.columnconfigure(16, weight=1)
+        resource_row.columnconfigure(13, weight=1)
         row2.columnconfigure(16, weight=1)
         row3.columnconfigure(16, weight=1)
         progress_row.columnconfigure(1, weight=1)
@@ -1417,46 +1623,102 @@ class OpenCvJsonlViewer:
             row=0, column=7, padx=4
         )
 
-        ttk.Label(row1, text="帧序号").grid(row=0, column=8, padx=(14, 4))
-        ttk.Entry(row1, width=10, textvariable=self.frame_var).grid(
+        ttk.Label(row1, text="步长").grid(row=0, column=8, padx=(12, 4))
+        ttk.Entry(row1, width=6, textvariable=self.frame_step_var).grid(
             row=0, column=9, padx=4
         )
-        ttk.Button(row1, text="跳帧", command=self.jump_frame).grid(
-            row=0, column=10, padx=4
-        )
 
-        ttk.Label(row1, text="PTS").grid(row=0, column=11, padx=(14, 4))
-        ttk.Entry(row1, width=16, textvariable=self.pts_var).grid(
+        ttk.Label(row1, text="帧序号").grid(row=0, column=10, padx=(14, 4))
+        ttk.Entry(row1, width=10, textvariable=self.frame_var).grid(
+            row=0, column=11, padx=4
+        )
+        ttk.Button(row1, text="跳帧", command=self.jump_frame).grid(
             row=0, column=12, padx=4
         )
+
+        ttk.Label(row1, text="PTS").grid(row=0, column=13, padx=(14, 4))
+        ttk.Entry(row1, width=16, textvariable=self.pts_var).grid(
+            row=0, column=14, padx=4
+        )
         ttk.Button(row1, text="跳 PTS", command=self.jump_pts).grid(
-            row=0, column=13, padx=4
+            row=0, column=15, padx=4
         )
         self.choose_media_dir_button = ttk.Button(
-            row1,
+            resource_row,
             text="选择图片目录",
             command=self.choose_media_dir,
         )
-        self.choose_media_dir_button.grid(row=0, column=14, padx=(18, 4))
-        ttk.Button(row1, text="选择 JSONL", command=self.choose_jsonl).grid(
-            row=0, column=15, padx=4
+        self.choose_media_dir_button.grid(row=0, column=0, padx=(0, 4))
+        ttk.Button(resource_row, text="选择 JSONL", command=self.choose_jsonl).grid(
+            row=0, column=1, padx=4
         )
-        ttk.Button(row1, text="加载预设资源", command=self.load_preset_resources).grid(
-            row=0, column=16, padx=4
+        ttk.Button(
+            resource_row, text="加载预设资源", command=self.load_preset_resources
+        ).grid(
+            row=0, column=2, padx=4
         )
         self.cancel_jsonl_load_button = ttk.Button(
-            row1,
+            resource_row,
             text="取消加载",
             command=self.cancel_jsonl_load,
             state=tk.DISABLED,
         )
-        self.cancel_jsonl_load_button.grid(row=0, column=17, padx=4)
+        self.cancel_jsonl_load_button.grid(row=0, column=3, padx=4)
         self.json_sidebar_button = ttk.Button(
-            row1,
+            resource_row,
             text="展开JSON",
             command=self.toggle_json_sidebar,
         )
-        self.json_sidebar_button.grid(row=0, column=18, padx=4)
+        self.json_sidebar_button.grid(row=0, column=4, padx=(12, 4))
+        self.annotation_mode_button = ttk.Button(
+            resource_row,
+            text="开启球标注",
+            command=self.toggle_annotation_mode,
+        )
+        self.annotation_mode_button.grid(row=0, column=5, padx=(18, 4))
+        self.annotation_path_button = ttk.Button(
+            resource_row,
+            text="选择标注路径",
+            command=self.choose_annotation_work_path,
+        )
+        self.annotation_path_button.grid(row=0, column=6, padx=4)
+        ttk.Label(resource_row, text="保存模式").grid(row=0, column=7, padx=(12, 4))
+        annotation_save_mode_box = ttk.Combobox(
+            resource_row,
+            width=8,
+            textvariable=self.annotation_save_mode_var,
+            values=["自动保存", "手动保存"],
+            state="readonly",
+        )
+        annotation_save_mode_box.grid(row=0, column=8, padx=4)
+        self.save_annotation_button = ttk.Button(
+            resource_row,
+            text="保存标注",
+            command=self.save_annotation_now,
+            state=tk.DISABLED,
+        )
+        self.save_annotation_button.grid(row=0, column=9, padx=4)
+        self.undo_annotation_button = ttk.Button(
+            resource_row,
+            text="撤销本帧标注",
+            command=self.undo_current_frame_annotation,
+            state=tk.DISABLED,
+        )
+        self.undo_annotation_button.grid(row=0, column=10, padx=4)
+        self.clear_annotation_button = ttk.Button(
+            resource_row,
+            text="清空本帧标注",
+            command=self.clear_current_frame_annotations,
+            state=tk.DISABLED,
+        )
+        self.clear_annotation_button.grid(row=0, column=11, padx=4)
+        self.restore_original_ball_button = ttk.Button(
+            resource_row,
+            text="撤回原框删除",
+            command=self.undo_original_ball_deletion,
+            state=tk.DISABLED,
+        )
+        self.restore_original_ball_button.grid(row=0, column=12, padx=4)
 
         ttk.Checkbutton(
             row2,
@@ -1478,7 +1740,7 @@ class OpenCvJsonlViewer:
         video_scale = ttk.Scale(
             row2,
             from_=0.25,
-            to=1.2,
+            to=2.0,     #   视频放大倍数上限
             variable=self.video_scale_var,
             orient=tk.HORIZONTAL,
             command=self.on_video_scale_change,
@@ -1604,45 +1866,42 @@ class OpenCvJsonlViewer:
         ttk.Label(status_row, textvariable=self.status_var, anchor="w").grid(
             row=0, column=0, sticky="ew"
         )
-        ttk.Separator(status_row, orient=tk.VERTICAL).grid(
-            row=0, column=1, sticky="ns", padx=8
-        )
-        ttk.Label(status_row, text="缓冲目标").grid(row=0, column=2, padx=(0, 4))
+        ttk.Label(cache_row, text="缓冲目标").grid(row=0, column=0, padx=(0, 4))
         cache_target_entry = ttk.Entry(
-            status_row, width=6, textvariable=self.cache_target_var
+            cache_row, width=6, textvariable=self.cache_target_var
         )
-        cache_target_entry.grid(row=0, column=3, padx=(0, 4))
+        cache_target_entry.grid(row=0, column=1, padx=(0, 4))
         cache_target_entry.bind("<Return>", lambda _event: self.apply_cache_target())
-        ttk.Button(status_row, text="应用", command=self.apply_cache_target).grid(
-            row=0, column=4, padx=(0, 8)
+        ttk.Button(cache_row, text="应用", command=self.apply_cache_target).grid(
+            row=0, column=2, padx=(0, 8)
         )
-        ttk.Label(status_row, textvariable=self.cache_status_var, anchor="w").grid(
-            row=0, column=5, sticky="w"
+        ttk.Label(cache_row, textvariable=self.cache_status_var, anchor="w").grid(
+            row=0, column=3, sticky="w"
         )
-        image_separator = ttk.Separator(status_row, orient=tk.VERTICAL)
-        image_separator.grid(row=0, column=6, sticky="ns", padx=8)
-        image_before_label = ttk.Label(status_row, text="图片预载前")
-        image_before_label.grid(row=0, column=7, padx=(0, 4))
+        image_separator = ttk.Separator(cache_row, orient=tk.VERTICAL)
+        image_separator.grid(row=0, column=4, sticky="ns", padx=8)
+        image_before_label = ttk.Label(cache_row, text="图片预载前")
+        image_before_label.grid(row=0, column=5, padx=(0, 4), sticky="e")
         image_before_entry = ttk.Entry(
-            status_row, width=5, textvariable=self.image_prefetch_before_var
+            cache_row, width=5, textvariable=self.image_prefetch_before_var
         )
-        image_before_entry.grid(row=0, column=8, padx=(0, 4))
-        image_after_label = ttk.Label(status_row, text="后")
-        image_after_label.grid(row=0, column=9, padx=(4, 4))
+        image_before_entry.grid(row=0, column=6, padx=(0, 4))
+        image_after_label = ttk.Label(cache_row, text="后")
+        image_after_label.grid(row=0, column=7, padx=(4, 4))
         image_after_entry = ttk.Entry(
-            status_row, width=5, textvariable=self.image_prefetch_after_var
+            cache_row, width=5, textvariable=self.image_prefetch_after_var
         )
-        image_after_entry.grid(row=0, column=10, padx=(0, 4))
-        image_max_label = ttk.Label(status_row, text="上限")
-        image_max_label.grid(row=0, column=11, padx=(4, 4))
+        image_after_entry.grid(row=0, column=8, padx=(0, 4))
+        image_max_label = ttk.Label(cache_row, text="上限")
+        image_max_label.grid(row=0, column=9, padx=(4, 4))
         image_max_entry = ttk.Entry(
-            status_row, width=6, textvariable=self.image_cache_max_var
+            cache_row, width=6, textvariable=self.image_cache_max_var
         )
-        image_max_entry.grid(row=0, column=12, padx=(0, 4))
+        image_max_entry.grid(row=0, column=10, padx=(0, 4))
         image_apply_button = ttk.Button(
-            status_row, text="应用图片预载", command=self.apply_image_prefetch_range
+            cache_row, text="应用图片预载", command=self.apply_image_prefetch_range
         )
-        image_apply_button.grid(row=0, column=13, padx=(0, 8))
+        image_apply_button.grid(row=0, column=11, padx=(0, 8))
         for entry in [image_before_entry, image_after_entry, image_max_entry]:
             entry.bind("<Return>", lambda _event: self.apply_image_prefetch_range())
         self.image_prefetch_widgets = [
@@ -1694,11 +1953,13 @@ class OpenCvJsonlViewer:
         )
         self.video_canvas.bind("<ButtonPress-1>", self.on_canvas_press)
         self.video_canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        self.video_canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+        self.video_canvas.bind("<ButtonRelease-3>", self.on_canvas_right_click)
         self.video_canvas.bind("<MouseWheel>", self.on_canvas_mousewheel)
 
         hint = ttk.Label(
             left,
-            text="快捷键：空格播放/暂停，← 上一帧，→ 下一帧，q 退出；左键拖动画面，滚轮上下移动，Shift+滚轮左右移动",
+            text="快捷键：空格播放/暂停，← 上一帧，→ 下一帧，q 退出；普通模式左键拖动画面，球标注模式左键拖框、右键删除原始球框，滚轮上下移动，Shift+滚轮左右移动",
             anchor="center",
         )
         hint.grid(row=1, column=0, sticky="ew", pady=(8, 0))
@@ -1744,6 +2005,1177 @@ class OpenCvJsonlViewer:
             return
         label = "选择视频目录" if self.is_video_mode() else "选择图片目录"
         self.choose_media_dir_button.configure(text=label)
+
+    def update_annotation_buttons(self) -> None:
+        mode_text = "关闭球标注" if self.annotation_mode_enabled else "开启球标注"
+        edit_state = tk.NORMAL if self.annotation_mode_enabled else tk.DISABLED
+        path_state = tk.DISABLED if self.annotation_io_running else tk.NORMAL
+        if self.annotation_mode_button is not None:
+            self.annotation_mode_button.configure(
+                text=mode_text,
+                state=tk.DISABLED if self.annotation_io_running else tk.NORMAL,
+            )
+        if self.annotation_path_button is not None:
+            self.annotation_path_button.configure(state=path_state)
+        if self.save_annotation_button is not None:
+            save_state = (
+                tk.NORMAL
+                if self.annotation_work_path is not None
+                and not self.annotation_io_running
+                and not self.annotation_saving
+                else tk.DISABLED
+            )
+            self.save_annotation_button.configure(state=save_state)
+        if self.undo_annotation_button is not None:
+            self.undo_annotation_button.configure(state=edit_state)
+        if self.clear_annotation_button is not None:
+            self.clear_annotation_button.configure(state=edit_state)
+        if self.restore_original_ball_button is not None:
+            self.restore_original_ball_button.configure(state=edit_state)
+        if hasattr(self, "video_canvas"):
+            cursor = "crosshair" if self.annotation_mode_enabled else "fleur"
+            self.video_canvas.configure(cursor=cursor)
+
+    def reset_annotation_state(self) -> None:
+        self.save_annotation_work_if_dirty()
+        if self.annotation_save_after_id is not None:
+            self.root.after_cancel(self.annotation_save_after_id)
+            self.annotation_save_after_id = None
+        self.annotation_mode_enabled = False
+        self.manual_ball_annotations.clear()
+        self.deleted_original_ball_indices.clear()
+        self.deleted_original_ball_history.clear()
+        self.annotation_output_lines.clear()
+        self.annotation_key_to_output_indices.clear()
+        self.annotation_output_entries.clear()
+        self.annotation_work_path = None
+        self.annotation_loaded_path = None
+        self.annotation_io_token += 1
+        self.annotation_io_running = False
+        self.annotation_dirty = False
+        self.annotation_dirty_version = 0
+        self.annotation_last_saved_version = 0
+        self.close_after_annotation_save = False
+        self.pending_after_annotation_save = None
+        self.annotation_save_error = None
+        self.cancel_annotation_drag()
+        self.update_annotation_buttons()
+
+    def current_annotation_key(self) -> tuple[int, int] | None:
+        pts = self.current_display_pts()
+        if pts is None:
+            return None
+        return (self.current_camera, pts)
+
+    def annotation_key_from_item(
+        self,
+        item: dict[str, Any],
+        fallback_camera_id: int,
+    ) -> tuple[int, int] | None:
+        camera_id = camera_id_from_item(item) or fallback_camera_id
+        pts = item.get("pts")
+        try:
+            return (int(camera_id), int(pts))
+        except (TypeError, ValueError):
+            return None
+
+    def current_frame_manual_balls(self) -> list[dict[str, Any]]:
+        key = self.current_annotation_key()
+        if key is None:
+            return []
+        return self.manual_ball_annotations.get(key, [])
+
+    def current_frame_deleted_original_balls(self) -> set[int]:
+        key = self.current_annotation_key()
+        if key is None:
+            return set()
+        return self.deleted_original_ball_indices.get(key, set())
+
+    def default_annotation_work_path(self) -> Path:
+        jsonl_text = resource_to_text(self.current_jsonl_path)
+        if jsonl_text and not is_remote_resource(jsonl_text):
+            source_path = local_path_from_resource(jsonl_text)
+            stem = source_path.stem or "annotations"
+            return source_path.with_name(f"{stem}{ANNOTATION_WORK_SUFFIX}.jsonl")
+
+        name = display_resource_name(jsonl_text) if jsonl_text else "annotations.jsonl"
+        stem = Path(name).stem or "annotations"
+        return SCRIPT_DIR / f"{stem}{ANNOTATION_WORK_SUFFIX}.jsonl"
+
+    def annotation_work_path_in_directory(self, directory: Path) -> Path:
+        return directory / self.default_annotation_work_path().name
+
+    def resolve_annotation_work_path(self, selected_text: str) -> tuple[Path, bool]:
+        if is_remote_resource(selected_text):
+            raise ValueError("标注工作 JSONL 必须保存到本地路径，暂不支持远程地址")
+
+        selected_path = Path(selected_text).expanduser().resolve()
+        if selected_path.exists():
+            if selected_path.is_dir():
+                return self.annotation_work_path_in_directory(selected_path), True
+            return selected_path, False
+
+        if selected_path.suffix.lower() == ".jsonl":
+            return selected_path, False
+        return self.annotation_work_path_in_directory(selected_path), True
+
+    def choose_annotation_work_path(self, enable_after_done: bool = False) -> str:
+        if not self.store.cameras:
+            messagebox.showerror("无法选择标注路径", "请先加载 JSONL 数据")
+            return "cancelled"
+        if self.annotation_io_running:
+            messagebox.showinfo("标注任务进行中", "标注 JSONL 正在载入或创建，请稍候")
+            return "pending"
+
+        initial_path = self.annotation_work_path or self.default_annotation_work_path()
+        dialog = AnnotationWorkPathDialog(
+            self.root,
+            "选择标注路径",
+            str(initial_path),
+            initial_path.parent if initial_path.parent.is_dir() else PROJECT_DIR,
+        )
+        if dialog.result is None:
+            return "cancelled"
+        try:
+            selected_path, selected_directory = self.resolve_annotation_work_path(
+                dialog.result
+            )
+        except Exception as exc:
+            messagebox.showerror("标注路径不可用", str(exc))
+            return "cancelled"
+
+        self.annotation_work_path = selected_path
+        file_existed_before = selected_path.is_file()
+        already_loaded = (
+            file_existed_before
+            and self.annotation_loaded_path is not None
+            and self.annotation_loaded_path == selected_path
+            and bool(self.annotation_output_lines)
+        )
+        if already_loaded:
+            self.status_var.set(f"已确认当前标注文件：{self.annotation_work_path}")
+            self.render_current()
+            return "ready"
+
+        self.start_annotation_work_io_task(
+            selected_path,
+            file_existed_before=file_existed_before,
+            selected_directory=selected_directory,
+            enable_after_done=enable_after_done,
+        )
+        return "pending"
+
+    def start_annotation_work_io_task(
+        self,
+        selected_path: Path,
+        *,
+        file_existed_before: bool,
+        selected_directory: bool,
+        enable_after_done: bool,
+    ) -> None:
+        self.annotation_io_token += 1
+        token = self.annotation_io_token
+        self.annotation_io_running = True
+        self.update_annotation_buttons()
+
+        action = "load" if file_existed_before else "create"
+        if action == "load":
+            self.status_var.set(f"正在载入标注 JSONL：{selected_path} | 0%")
+        elif selected_directory:
+            self.status_var.set(f"正在复制标注 JSONL 到文件夹：{selected_path.parent} | 0%")
+        else:
+            self.status_var.set(f"正在复制标注 JSONL：{selected_path} | 0%")
+
+        manual_snapshot = deepcopy(self.manual_ball_annotations)
+        deleted_snapshot = {
+            key: set(indices)
+            for key, indices in self.deleted_original_ball_indices.items()
+        }
+
+        def progress_cb(pct: int, detail: str) -> None:
+            self.video_result_queue.put(
+                {
+                    "kind": "annotation_work_progress",
+                    "token": token,
+                    "action": action,
+                    "path": selected_path,
+                    "pct": pct,
+                    "detail": detail,
+                }
+            )
+
+        def worker() -> None:
+            error = None
+            manual_annotations = None
+            deleted_original_ball_indices = None
+            output_lines = None
+            key_to_output_indices = None
+            output_entries = None
+            try:
+                if action == "load":
+                    (
+                        manual_annotations,
+                        deleted_original_ball_indices,
+                    ) = self.read_annotation_work_file_data(selected_path, progress_cb)
+                else:
+                    manual_annotations = manual_snapshot
+                    deleted_original_ball_indices = deleted_snapshot
+                (
+                    output_lines,
+                    key_to_output_indices,
+                    output_entries,
+                ) = self.build_annotation_output_cache(
+                    manual_annotations or {},
+                    deleted_original_ball_indices or {},
+                    progress_callback=progress_cb,
+                )
+                if action == "create":
+                    self.write_annotation_output_lines(
+                        selected_path,
+                        output_lines,
+                        progress_callback=progress_cb,
+                    )
+            except Exception as exc:
+                error = str(exc)
+
+            self.video_result_queue.put(
+                {
+                    "kind": "annotation_work_done",
+                    "token": token,
+                    "action": action,
+                    "path": selected_path,
+                    "error": error,
+                    "manual_annotations": manual_annotations,
+                    "deleted_original_ball_indices": deleted_original_ball_indices,
+                    "output_lines": output_lines,
+                    "key_to_output_indices": key_to_output_indices,
+                    "output_entries": output_entries,
+                    "enable_after_done": enable_after_done,
+                }
+            )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    def read_annotation_work_file_data(
+        self,
+        path: Path,
+        progress_callback: Any | None = None,
+    ) -> tuple[
+        dict[tuple[int, int], list[dict[str, Any]]],
+        dict[tuple[int, int], set[int]],
+    ]:
+        file_size = path.stat().st_size if path.is_file() else 0
+        bytes_read = 0
+        total_lines = 0
+        loaded: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        kept_original_signatures: dict[tuple[int, int], Counter[str]] = {}
+        work_keys: set[tuple[int, int]] = set()
+
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                bytes_read += len(line.encode("utf-8"))
+                total_lines += 1
+                if progress_callback and total_lines % 500 == 0:
+                    pct = min(95, int(bytes_read * 95 / max(1, file_size)))
+                    progress_callback(pct, f"{total_lines} 行")
+
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                result, _missing = result_dict_from_item(item)
+                camera_id = camera_id_from_item(item)
+                pts = item.get("pts")
+                try:
+                    key = (int(camera_id), int(pts))
+                except (TypeError, ValueError):
+                    continue
+
+                balls, _state = detection_list_from_result(result, "balls")
+                work_keys.add(key)
+                manual_balls = [
+                    deepcopy(ball)
+                    for ball in balls
+                    if is_manual_ball(ball)
+                ]
+                for ball in manual_balls:
+                    ball.pop("source", None)
+                    ball["score"] = MANUAL_BALL_SCORE
+                if manual_balls:
+                    loaded[key] = manual_balls
+                kept_original_signatures[key] = Counter(
+                    ball_signature(ball) for ball in balls if not is_manual_ball(ball)
+                )
+
+        if progress_callback:
+            progress_callback(96, "分析被删除的原始球框")
+        deleted = self.infer_deleted_original_balls(kept_original_signatures, work_keys)
+        if progress_callback:
+            progress_callback(100, f"{total_lines} 行")
+        return loaded, deleted
+
+    def sorted_annotation_items(self) -> list[tuple[int, int, int, dict[str, Any]]]:
+        items: list[tuple[int, int, int, dict[str, Any]]] = []
+        for camera_id, annotation in self.store.cameras.items():
+            for item in annotation.items:
+                result, _missing = result_dict_from_item(item)
+                try:
+                    pts = int(item.get("pts"))
+                except (TypeError, ValueError):
+                    pts = 0
+                try:
+                    sort_camera = int(result.get("cam_idx", camera_id))
+                except (TypeError, ValueError):
+                    sort_camera = camera_id
+                items.append((pts, sort_camera, camera_id, item))
+        items.sort(key=lambda entry: (entry[0], entry[1]))
+        return items
+
+    def build_annotation_output_cache(
+        self,
+        manual_annotations: dict[tuple[int, int], list[dict[str, Any]]],
+        deleted_original_ball_indices: dict[tuple[int, int], set[int]],
+        progress_callback: Any | None = None,
+    ) -> tuple[
+        list[str],
+        dict[tuple[int, int], list[int]],
+        list[tuple[int, dict[str, Any]]],
+    ]:
+        items = self.sorted_annotation_items()
+        total_items = max(1, len(items))
+        output_lines: list[str] = []
+        key_to_output_indices: dict[tuple[int, int], list[int]] = {}
+        output_entries: list[tuple[int, dict[str, Any]]] = []
+
+        for line_index, (_pts, _sort_camera, camera_id, item) in enumerate(items):
+            output_item = self.build_annotation_work_item(
+                item,
+                camera_id,
+                manual_annotations,
+                deleted_original_ball_indices,
+            )
+            output_lines.append(json.dumps(output_item, ensure_ascii=False))
+            output_entries.append((camera_id, item))
+            key = self.annotation_key_from_item(item, camera_id)
+            if key is not None:
+                key_to_output_indices.setdefault(key, []).append(line_index)
+
+            if progress_callback and (line_index + 1) % 500 == 0:
+                pct = min(95, int((line_index + 1) * 95 / total_items))
+                progress_callback(pct, f"构建输出缓存 {line_index + 1}/{total_items} 行")
+
+        if progress_callback:
+            progress_callback(96, "输出缓存构建完成")
+        return output_lines, key_to_output_indices, output_entries
+
+    def rebuild_annotation_output_lines_for_key(
+        self,
+        key: tuple[int, int],
+    ) -> None:
+        indices = self.annotation_key_to_output_indices.get(key)
+        if not indices:
+            return
+        for line_index in indices:
+            if line_index >= len(self.annotation_output_entries):
+                continue
+            fallback_camera_id, item = self.annotation_output_entries[line_index]
+            output_item = self.build_annotation_work_item(
+                item,
+                fallback_camera_id,
+                self.manual_ball_annotations,
+                self.deleted_original_ball_indices,
+            )
+            self.annotation_output_lines[line_index] = json.dumps(
+                output_item,
+                ensure_ascii=False,
+            )
+
+    def write_annotation_output_lines(
+        self,
+        target_path: Path,
+        output_lines: list[str],
+        progress_callback: Any | None = None,
+    ) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
+        total_lines = max(1, len(output_lines))
+        with self.annotation_write_lock:
+            with tmp_path.open("w", encoding="utf-8", newline="\n") as fh:
+                for line_index, line in enumerate(output_lines, start=1):
+                    fh.write(line)
+                    fh.write("\n")
+                    if progress_callback and line_index % 500 == 0:
+                        pct = min(99, int(line_index * 100 / total_lines))
+                        progress_callback(pct, f"写入 {line_index}/{total_lines} 行")
+            if progress_callback:
+                progress_callback(100, f"写入 {len(output_lines)}/{len(output_lines)} 行")
+            tmp_path.replace(target_path)
+
+    def handle_annotation_work_progress(self, result: dict[str, Any]) -> None:
+        if result.get("token") != self.annotation_io_token:
+            return
+        action = result.get("action")
+        pct = result.get("pct")
+        path = result.get("path")
+        detail = result.get("detail") or ""
+        verb = "载入" if action == "load" else "复制"
+        self.status_var.set(
+            f"正在{verb}标注 JSONL：{path} | {pct}% | {detail}"
+        )
+
+    def handle_annotation_work_done(self, result: dict[str, Any]) -> None:
+        if result.get("token") != self.annotation_io_token:
+            return
+        self.annotation_io_running = False
+        self.update_annotation_buttons()
+
+        error = result.get("error")
+        path = result.get("path")
+        if error is not None:
+            messagebox.showerror("标注 JSONL 处理失败", str(error))
+            self.status_var.set(f"标注 JSONL 处理失败：{error}")
+            return
+
+        if result.get("action") == "load":
+            self.manual_ball_annotations = result.get("manual_annotations") or {}
+            self.deleted_original_ball_indices = (
+                result.get("deleted_original_ball_indices") or {}
+            )
+            self.deleted_original_ball_history = {
+                key: list(sorted(indices))
+                for key, indices in self.deleted_original_ball_indices.items()
+            }
+            action_text = "已载入标注 JSONL"
+        else:
+            action_text = "已创建标注工作 JSONL"
+
+        self.annotation_output_lines = result.get("output_lines") or []
+        self.annotation_key_to_output_indices = (
+            result.get("key_to_output_indices") or {}
+        )
+        self.annotation_output_entries = result.get("output_entries") or []
+        self.annotation_work_path = path
+        self.annotation_loaded_path = path
+        self.annotation_dirty = False
+        self.annotation_save_error = None
+
+        if result.get("enable_after_done"):
+            self.annotation_mode_enabled = True
+            self.update_annotation_buttons()
+            self.status_var.set(f"{action_text}，球标注已开启：{path}")
+        else:
+            self.status_var.set(f"{action_text}：{path}")
+        self.render_current()
+
+    def toggle_annotation_mode(self) -> None:
+        if self.annotation_mode_enabled:
+            if self.annotation_dirty:
+                answer = messagebox.askyesnocancel(
+                    "标注尚未保存",
+                    "当前标注 JSONL 有未保存改动，关闭球标注前是否保存？\n\n"
+                    "选择「是」：立即后台保存。\n"
+                    "选择「否」：暂不保存，保留当前内存改动。\n"
+                    "选择「取消」：继续标注。",
+                )
+                if answer is None:
+                    return
+                if answer:
+                    if self.annotation_save_after_id is not None:
+                        self.root.after_cancel(self.annotation_save_after_id)
+                        self.annotation_save_after_id = None
+                    self.start_annotation_save_worker()
+                    self.status_var.set(
+                        f"正在后台保存标注 JSONL：{self.annotation_work_path}"
+                    )
+            self.annotation_mode_enabled = False
+            self.cancel_annotation_drag()
+            self.update_annotation_buttons()
+            self.render_current()
+            return
+
+        if not self.store.cameras:
+            messagebox.showerror("无法标注", "请先加载 JSONL 数据")
+            return
+        result = self.choose_annotation_work_path(enable_after_done=True)
+        if result == "cancelled":
+            self.status_var.set("已取消开启球标注")
+            return
+        if result == "pending":
+            return
+        try:
+            self.ensure_annotation_work_file()
+        except Exception as exc:
+            messagebox.showerror("标注文件创建失败", str(exc))
+            self.status_var.set(f"标注文件创建失败：{exc}")
+            return
+
+        self.annotation_mode_enabled = True
+        self.update_annotation_buttons()
+        self.status_var.set(
+            f"球标注已开启：{self.annotation_work_path} | 保存模式 {self.annotation_save_mode_var.get()}"
+        )
+        self.render_current()
+
+    def ensure_annotation_work_file(self) -> None:
+        if self.annotation_work_path is None:
+            self.annotation_work_path = self.default_annotation_work_path()
+        self.annotation_work_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.annotation_work_path.is_file():
+            if self.annotation_loaded_path == self.annotation_work_path:
+                return
+            self.load_manual_annotations_from_work_file()
+            (
+                self.annotation_output_lines,
+                self.annotation_key_to_output_indices,
+                self.annotation_output_entries,
+            ) = self.build_annotation_output_cache(
+                self.manual_ball_annotations,
+                self.deleted_original_ball_indices,
+            )
+            self.annotation_dirty = False
+            self.annotation_loaded_path = self.annotation_work_path
+            return
+        (
+            self.annotation_output_lines,
+            self.annotation_key_to_output_indices,
+            self.annotation_output_entries,
+        ) = self.build_annotation_output_cache(
+            self.manual_ball_annotations,
+            self.deleted_original_ball_indices,
+        )
+        self.write_annotation_output_lines(
+            self.annotation_work_path,
+            self.annotation_output_lines,
+        )
+        self.annotation_loaded_path = self.annotation_work_path
+
+    def load_manual_annotations_from_work_file(self) -> None:
+        if self.annotation_work_path is None or not self.annotation_work_path.is_file():
+            return
+
+        loaded, deleted = self.read_annotation_work_file_data(self.annotation_work_path)
+        self.manual_ball_annotations = loaded
+        self.deleted_original_ball_indices = deleted
+        self.deleted_original_ball_history = {
+            key: list(sorted(indices))
+            for key, indices in self.deleted_original_ball_indices.items()
+        }
+
+    def infer_deleted_original_balls(
+        self,
+        kept_original_signatures: dict[tuple[int, int], Counter[str]],
+        work_keys: set[tuple[int, int]],
+    ) -> dict[tuple[int, int], set[int]]:
+        deleted: dict[tuple[int, int], set[int]] = {}
+        for camera_id, annotation in self.store.cameras.items():
+            for item in annotation.items:
+                key = self.annotation_key_from_item(item, camera_id)
+                if key is None or key not in work_keys:
+                    continue
+                result, _missing = result_dict_from_item(item)
+                original_balls, _state = detection_list_from_result(result, "balls")
+                kept = kept_original_signatures.get(key, Counter()).copy()
+                for index, ball in enumerate(
+                    ball for ball in original_balls if not is_manual_ball(ball)
+                ):
+                    signature = ball_signature(ball)
+                    if kept[signature] > 0:
+                        kept[signature] -= 1
+                        continue
+                    deleted.setdefault(key, set()).add(index)
+        return deleted
+
+    def save_annotation_work_if_dirty(self) -> None:
+        if not self.annotation_dirty:
+            return
+        if self.annotation_save_after_id is not None:
+            self.root.after_cancel(self.annotation_save_after_id)
+            self.annotation_save_after_id = None
+        try:
+            if self.annotation_work_path is None:
+                self.annotation_work_path = self.default_annotation_work_path()
+            self.write_annotation_output_lines(
+                self.annotation_work_path,
+                self.annotation_output_lines,
+            )
+            self.annotation_last_saved_version = self.annotation_dirty_version
+            self.annotation_dirty = False
+        except Exception as exc:
+            self.annotation_save_error = str(exc)
+            messagebox.showerror("标注自动保存失败", str(exc))
+            self.status_var.set(f"标注自动保存失败：{exc}")
+
+    def mark_annotation_dirty_and_save(
+        self,
+        changed_key: tuple[int, int] | None = None,
+    ) -> bool:
+        if changed_key is not None:
+            self.rebuild_annotation_output_lines_for_key(changed_key)
+        self.annotation_dirty = True
+        self.annotation_dirty_version += 1
+        return True
+
+    def schedule_annotation_save(self) -> None:
+        if self.annotation_save_after_id is not None:
+            self.root.after_cancel(self.annotation_save_after_id)
+        self.annotation_save_after_id = self.root.after(
+            ANNOTATION_SAVE_DEBOUNCE_MS,
+            self.start_annotation_save_worker,
+        )
+
+    def is_annotation_auto_save_mode(self) -> bool:
+        return self.annotation_save_mode_var.get() == "自动保存"
+
+    def set_pending_after_annotation_save(
+        self,
+        action: str,
+        *args: Any,
+    ) -> None:
+        self.pending_after_annotation_save = (action, args)
+
+    def run_pending_after_annotation_save(self) -> None:
+        pending = self.pending_after_annotation_save
+        self.pending_after_annotation_save = None
+        if pending is None:
+            return
+        action, args = pending
+        if action == "seek":
+            self.seek_and_render(int(args[0]))
+        elif action == "open_camera":
+            camera_id = int(args[0])
+            target_pts = args[1]
+            self.open_camera(camera_id, target_pts=target_pts)
+        elif action == "change_mode":
+            self.change_mode()
+        elif action == "close":
+            self.close_without_annotation_prompt()
+
+    def start_annotation_save_for_pending_action(
+        self,
+        action: str,
+        *args: Any,
+    ) -> bool:
+        if not self.annotation_dirty:
+            return True
+        self.set_pending_after_annotation_save(action, *args)
+        if self.annotation_save_after_id is not None:
+            self.root.after_cancel(self.annotation_save_after_id)
+            self.annotation_save_after_id = None
+        if self.annotation_saving:
+            self.status_var.set("标注 JSONL 正在保存中，保存完成后继续操作")
+            return False
+        self.start_annotation_save_worker()
+        self.status_var.set("正在保存标注 JSONL，保存完成后继续操作")
+        return False
+
+    def confirm_unsaved_annotation_navigation(
+        self,
+        action_name: str,
+        pending_action: str,
+        *pending_args: Any,
+    ) -> bool:
+        if not self.annotation_dirty:
+            return True
+        if self.is_annotation_auto_save_mode():
+            return self.start_annotation_save_for_pending_action(
+                pending_action,
+                *pending_args,
+            )
+
+        answer = messagebox.askyesnocancel(
+            "标注尚未保存",
+            f"当前标注 JSONL 有未保存改动，是否在{action_name}前保存？\n\n"
+            "选择「是」：保存完成后继续操作。\n"
+            "选择「否」：不保存并继续操作。\n"
+            "选择「取消」：留在当前画面。",
+        )
+        if answer is None:
+            return False
+        if answer:
+            return self.start_annotation_save_for_pending_action(
+                pending_action,
+                *pending_args,
+            )
+        return True
+
+    def start_annotation_save_worker(self) -> None:
+        self.annotation_save_after_id = None
+        if not self.annotation_dirty:
+            return
+        if self.annotation_saving:
+            self.annotation_save_after_id = self.root.after(
+                ANNOTATION_SAVE_DEBOUNCE_MS,
+                self.start_annotation_save_worker,
+            )
+            return
+        try:
+            if self.annotation_work_path is None:
+                self.annotation_work_path = self.default_annotation_work_path()
+            self.annotation_work_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.annotation_save_error = str(exc)
+            self.status_var.set(f"标注自动保存失败：{exc}")
+            return
+
+        save_version = self.annotation_dirty_version
+        save_path = self.annotation_work_path
+        output_lines_snapshot = list(self.annotation_output_lines)
+        self.annotation_saving = True
+        self.update_annotation_buttons()
+        self.status_var.set(f"正在保存标注 JSONL：{save_path} | 0%")
+
+        def progress_cb(pct: int, detail: str) -> None:
+            self.video_result_queue.put(
+                {
+                    "kind": "annotation_save_progress",
+                    "version": save_version,
+                    "path": save_path,
+                    "pct": pct,
+                    "detail": detail,
+                }
+            )
+
+        def worker() -> None:
+            error = None
+            try:
+                self.write_annotation_output_lines(
+                    save_path,
+                    output_lines_snapshot,
+                    progress_callback=progress_cb,
+                )
+            except Exception as exc:
+                error = str(exc)
+            self.video_result_queue.put(
+                {
+                    "kind": "annotation_save",
+                    "version": save_version,
+                    "path": save_path,
+                    "error": error,
+                }
+            )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    def save_annotation_now(self) -> None:
+        if self.annotation_work_path is None:
+            messagebox.showinfo("无法保存", "请先选择或创建标注 JSONL 路径")
+            return
+        if self.annotation_io_running:
+            messagebox.showinfo("标注任务进行中", "标注 JSONL 正在载入或创建，请稍候")
+            return
+        if self.annotation_saving:
+            self.status_var.set(f"标注 JSONL 正在保存中：{self.annotation_work_path}")
+            return
+        if self.annotation_save_after_id is not None:
+            self.root.after_cancel(self.annotation_save_after_id)
+            self.annotation_save_after_id = None
+        if not self.annotation_dirty:
+            self.status_var.set(f"标注 JSONL 无需保存：{self.annotation_work_path}")
+            return
+        self.start_annotation_save_worker()
+
+    def handle_annotation_save_progress(self, result: dict[str, Any]) -> None:
+        if int(result.get("version", -1)) < self.annotation_last_saved_version:
+            return
+        pct = result.get("pct")
+        detail = result.get("detail") or ""
+        path = result.get("path")
+        self.status_var.set(f"正在保存标注 JSONL：{path} | {pct}% | {detail}")
+
+    def handle_annotation_save_result(self, result: dict[str, Any]) -> None:
+        version = int(result["version"])
+        error = result.get("error")
+        self.annotation_saving = False
+        self.update_annotation_buttons()
+        if error is not None:
+            self.annotation_save_error = str(error)
+            messagebox.showerror("标注自动保存失败", str(error))
+            self.status_var.set(f"标注自动保存失败：{error}")
+            return
+        self.annotation_save_error = None
+        path = result.get("path")
+        if path is not None:
+            self.annotation_loaded_path = path
+        if version >= self.annotation_last_saved_version:
+            self.annotation_last_saved_version = version
+        if version == self.annotation_dirty_version:
+            self.annotation_dirty = False
+            self.status_var.set(f"标注 JSONL 保存完成：{path}")
+            if self.close_after_annotation_save:
+                self.close_after_annotation_save = False
+                self.close_without_annotation_prompt()
+                return
+            self.run_pending_after_annotation_save()
+        elif self.annotation_dirty:
+            self.schedule_annotation_save()
+
+    def write_annotation_work_jsonl(
+        self,
+        manual_annotations: dict[tuple[int, int], list[dict[str, Any]]] | None = None,
+        deleted_original_ball_indices: dict[tuple[int, int], set[int]] | None = None,
+        mark_clean: bool = True,
+        output_path: Path | None = None,
+        progress_callback: Any | None = None,
+    ) -> None:
+        if output_path is None and self.annotation_work_path is None:
+            self.annotation_work_path = self.default_annotation_work_path()
+        target_path = output_path or self.annotation_work_path
+        if target_path is None:
+            raise ValueError("标注 JSONL 路径未设置")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
+        if manual_annotations is None:
+            manual_annotations = deepcopy(self.manual_ball_annotations)
+        if deleted_original_ball_indices is None:
+            deleted_original_ball_indices = {
+                key: set(indices)
+                for key, indices in self.deleted_original_ball_indices.items()
+            }
+
+        items: list[tuple[int, int, int, dict[str, Any]]] = []
+        for camera_id, annotation in self.store.cameras.items():
+            for item in annotation.items:
+                result, _missing = result_dict_from_item(item)
+                try:
+                    pts = int(item.get("pts"))
+                except (TypeError, ValueError):
+                    pts = 0
+                try:
+                    sort_camera = int(result.get("cam_idx", camera_id))
+                except (TypeError, ValueError):
+                    sort_camera = camera_id
+                items.append((pts, sort_camera, camera_id, item))
+        items.sort(key=lambda entry: (entry[0], entry[1]))
+        total_items = max(1, len(items))
+
+        with self.annotation_write_lock:
+            with tmp_path.open("w", encoding="utf-8", newline="\n") as fh:
+                for line_index, (_pts, _sort_camera, camera_id, item) in enumerate(
+                    items,
+                    start=1,
+                ):
+                    output_item = self.build_annotation_work_item(
+                        item,
+                        camera_id,
+                        manual_annotations,
+                        deleted_original_ball_indices,
+                    )
+                    fh.write(json.dumps(output_item, ensure_ascii=False))
+                    fh.write("\n")
+                    if progress_callback and line_index % 500 == 0:
+                        pct = min(99, int(line_index * 100 / total_items))
+                        progress_callback(pct, f"{line_index}/{total_items} 行")
+            if progress_callback:
+                progress_callback(100, f"{len(items)}/{len(items)} 行")
+            tmp_path.replace(target_path)
+        if output_path is None:
+            self.annotation_loaded_path = self.annotation_work_path
+        if mark_clean:
+            self.annotation_dirty = False
+
+    def build_annotation_work_item(
+        self,
+        item: dict[str, Any],
+        fallback_camera_id: int,
+        manual_annotations: dict[tuple[int, int], list[dict[str, Any]]],
+        deleted_original_ball_indices: dict[tuple[int, int], set[int]],
+    ) -> dict[str, Any]:
+        output_item = deepcopy(item)
+        result, _missing = result_dict_from_item(output_item)
+        if "result" not in output_item or not isinstance(output_item.get("result"), dict):
+            output_item["result"] = result
+
+        manual_key = self.annotation_key_from_item(output_item, fallback_camera_id)
+
+        original_balls, _state = detection_list_from_result(result, "balls")
+        deleted_indices = (
+            deleted_original_ball_indices.get(manual_key, set())
+            if manual_key is not None
+            else set()
+        )
+        copied_original_balls = [
+            deepcopy(ball)
+            for index, ball in enumerate(
+                ball for ball in original_balls if not is_manual_ball(ball)
+            )
+            if index not in deleted_indices
+        ]
+        manual_balls = (
+            [deepcopy(ball) for ball in manual_annotations.get(manual_key, [])]
+            if manual_key is not None
+            else []
+        )
+        for ball in manual_balls:
+            ball.pop("source", None)
+            ball["score"] = MANUAL_BALL_SCORE
+
+        result["balls"] = copied_original_balls + manual_balls
+        return output_item
+
+    def undo_current_frame_annotation(self) -> None:
+        if not self.annotation_mode_enabled:
+            return
+        key = self.current_annotation_key()
+        if key is None:
+            return
+        balls = self.manual_ball_annotations.get(key)
+        if not balls:
+            self.status_var.set("当前帧没有可撤销的人工球框")
+            return
+        balls.pop()
+        if balls:
+            self.manual_ball_annotations[key] = balls
+        else:
+            self.manual_ball_annotations.pop(key, None)
+        if self.mark_annotation_dirty_and_save(key):
+            self.status_var.set(f"已撤销当前帧最后一个球框，标注未保存：{self.annotation_work_path}")
+        self.render_current()
+
+    def clear_current_frame_annotations(self) -> None:
+        if not self.annotation_mode_enabled:
+            return
+        key = self.current_annotation_key()
+        if key is None or key not in self.manual_ball_annotations:
+            self.status_var.set("当前帧没有人工球框可清空")
+            return
+        self.manual_ball_annotations.pop(key, None)
+        if self.mark_annotation_dirty_and_save(key):
+            self.status_var.set(f"已清空当前帧人工球框，标注未保存：{self.annotation_work_path}")
+        self.render_current()
+
+    def undo_original_ball_deletion(self) -> None:
+        if not self.annotation_mode_enabled:
+            return
+        key = self.current_annotation_key()
+        if key is None:
+            return
+        history = self.deleted_original_ball_history.get(key)
+        if not history:
+            self.status_var.set("当前帧没有可撤回的原始球框删除")
+            return
+        index = history.pop()
+        deleted_indices = self.deleted_original_ball_indices.get(key)
+        if deleted_indices is not None:
+            deleted_indices.discard(index)
+            if not deleted_indices:
+                self.deleted_original_ball_indices.pop(key, None)
+        if not history:
+            self.deleted_original_ball_history.pop(key, None)
+        if self.mark_annotation_dirty_and_save(key):
+            self.status_var.set(f"已撤回原始球框删除，标注未保存：{self.annotation_work_path}")
+        self.render_current()
+
+    def is_canvas_point_in_bbox(
+        self,
+        canvas_x: float,
+        canvas_y: float,
+        bbox_rect: tuple[int, int, int, int],
+    ) -> bool:
+        x1, y1, x2, y2 = bbox_rect
+        return (
+            x1 - ANNOTATION_HIT_TOLERANCE
+            <= canvas_x
+            <= x2 + ANNOTATION_HIT_TOLERANCE
+            and y1 - ANNOTATION_HIT_TOLERANCE
+            <= canvas_y
+            <= y2 + ANNOTATION_HIT_TOLERANCE
+        )
+
+    def collect_ball_delete_candidates(
+        self,
+        canvas_x: float,
+        canvas_y: float,
+    ) -> list[tuple[float, str, int, tuple[int, int] | None]]:
+        if self.current_raw_frame is None:
+            return []
+
+        frame_h, frame_w = self.current_raw_frame.shape[:2]
+        scale_x = self.display_width / frame_w
+        scale_y = self.display_height / frame_h
+        candidates: list[tuple[float, str, int, tuple[int, int] | None]] = []
+
+        manual_key = self.current_annotation_key()
+        if manual_key is not None:
+            for index, ball in enumerate(
+                self.manual_ball_annotations.get(manual_key, [])
+            ):
+                bbox_rect = scaled_bbox(ball.get("bbox"), scale_x, scale_y)
+                if bbox_rect is None:
+                    continue
+                x1, y1, x2, y2 = bbox_rect
+                if self.is_canvas_point_in_bbox(canvas_x, canvas_y, bbox_rect):
+                    area = max(1, (x2 - x1) * (y2 - y1))
+                    candidates.append((area, "manual", index, manual_key))
+
+        annotation = self.get_annotation()
+        json_index = max(
+            0,
+            min(
+                self.current_index + self.json_offset_frames,
+                len(annotation.items) - 1,
+            ),
+        )
+        item = annotation.items[json_index]
+        original_key = self.annotation_key_from_item(item, self.current_camera)
+        if original_key is None:
+            return candidates
+
+        result, _missing = result_dict_from_item(item)
+        balls, _state = detection_list_from_result(result, "balls")
+        deleted_indices = self.deleted_original_ball_indices.get(original_key, set())
+        original_index = -1
+        for ball in balls:
+            if is_manual_ball(ball):
+                continue
+            original_index += 1
+            if original_index in deleted_indices:
+                continue
+            bbox_rect = scaled_bbox(ball.get("bbox"), scale_x, scale_y)
+            if bbox_rect is None:
+                continue
+            x1, y1, x2, y2 = bbox_rect
+            if self.is_canvas_point_in_bbox(canvas_x, canvas_y, bbox_rect):
+                area = max(1, (x2 - x1) * (y2 - y1))
+                candidates.append((area, "original", original_index, original_key))
+
+        return candidates
+
+    def delete_ball_at_canvas_point(self, canvas_x: float, canvas_y: float) -> None:
+        candidates = self.collect_ball_delete_candidates(canvas_x, canvas_y)
+        if not candidates:
+            self.status_var.set("右键位置没有可删除的球框")
+            return
+
+        _area, ball_type, index, key = min(candidates, key=lambda item: item[0])
+        if key is None:
+            return
+
+        if ball_type == "manual":
+            manual_balls = self.manual_ball_annotations.get(key)
+            if not manual_balls or index >= len(manual_balls):
+                return
+            manual_balls.pop(index)
+            if manual_balls:
+                self.manual_ball_annotations[key] = manual_balls
+            else:
+                self.manual_ball_annotations.pop(key, None)
+            if self.mark_annotation_dirty_and_save(key):
+                self.status_var.set(
+                    f"已删除人工球框 {index + 1}，标注未保存：{self.annotation_work_path}"
+                )
+            self.render_current()
+            return
+
+        self.deleted_original_ball_indices.setdefault(key, set()).add(index)
+        self.deleted_original_ball_history.setdefault(key, []).append(index)
+        if self.mark_annotation_dirty_and_save(key):
+            self.status_var.set(
+                f"已删除原始球框 {index + 1}，标注未保存：{self.annotation_work_path}"
+            )
+        self.render_current()
+
+    def delete_original_ball_at_canvas_point(self, canvas_x: float, canvas_y: float) -> None:
+        if self.current_raw_frame is None:
+            return
+        annotation = self.get_annotation()
+        json_index = max(
+            0,
+            min(
+                self.current_index + self.json_offset_frames,
+                len(annotation.items) - 1,
+            ),
+        )
+        item = annotation.items[json_index]
+        key = self.annotation_key_from_item(item, self.current_camera)
+        if key is None:
+            return
+
+        result, _missing = result_dict_from_item(item)
+        balls, _state = detection_list_from_result(result, "balls")
+        frame_h, frame_w = self.current_raw_frame.shape[:2]
+        scale_x = self.display_width / frame_w
+        scale_y = self.display_height / frame_h
+        deleted_indices = self.deleted_original_ball_indices.get(key, set())
+        candidates: list[tuple[float, int]] = []
+        original_index = -1
+        for ball in balls:
+            if is_manual_ball(ball):
+                continue
+            original_index += 1
+            if original_index in deleted_indices:
+                continue
+            bbox_rect = scaled_bbox(ball.get("bbox"), scale_x, scale_y)
+            if bbox_rect is None:
+                continue
+            x1, y1, x2, y2 = bbox_rect
+            if x1 <= canvas_x <= x2 and y1 <= canvas_y <= y2:
+                area = max(1, (x2 - x1) * (y2 - y1))
+                candidates.append((area, original_index))
+
+        if not candidates:
+            self.status_var.set("右键位置没有可删除的原始球框")
+            return
+
+        _area, original_index = min(candidates, key=lambda item: item[0])
+        self.deleted_original_ball_indices.setdefault(key, set()).add(original_index)
+        self.deleted_original_ball_history.setdefault(key, []).append(original_index)
+        if self.mark_annotation_dirty_and_save(key):
+            self.status_var.set(
+                f"已删除原始球框 {original_index + 1}，标注未保存：{self.annotation_work_path}"
+            )
+        self.render_current()
+
+    def delete_manual_ball_at_canvas_point(self, canvas_x: float, canvas_y: float) -> bool:
+        if self.current_raw_frame is None:
+            return False
+        key = self.current_annotation_key()
+        if key is None:
+            return False
+        manual_balls = self.manual_ball_annotations.get(key)
+        if not manual_balls:
+            return False
+
+        frame_h, frame_w = self.current_raw_frame.shape[:2]
+        scale_x = self.display_width / frame_w
+        scale_y = self.display_height / frame_h
+        candidates: list[tuple[float, int]] = []
+        for index, ball in enumerate(manual_balls):
+            bbox_rect = scaled_bbox(ball.get("bbox"), scale_x, scale_y)
+            if bbox_rect is None:
+                continue
+            x1, y1, x2, y2 = bbox_rect
+            if x1 <= canvas_x <= x2 and y1 <= canvas_y <= y2:
+                area = max(1, (x2 - x1) * (y2 - y1))
+                candidates.append((area, index))
+
+        if not candidates:
+            return False
+
+        _area, manual_index = min(candidates, key=lambda item: item[0])
+        manual_balls.pop(manual_index)
+        if manual_balls:
+            self.manual_ball_annotations[key] = manual_balls
+        else:
+            self.manual_ball_annotations.pop(key, None)
+        if self.mark_annotation_dirty_and_save(key):
+            self.status_var.set(
+                f"已删除人工球框 {manual_index + 1}，标注未保存：{self.annotation_work_path}"
+            )
+        self.render_current()
+        return True
+
+    def cancel_annotation_drag(self) -> None:
+        self.annotation_drag_start = None
+        if self.annotation_preview_rect_id is not None and hasattr(self, "video_canvas"):
+            self.video_canvas.delete(self.annotation_preview_rect_id)
+        self.annotation_preview_rect_id = None
 
     def get_annotation(self) -> CameraAnnotation:
         annotation = self.store.cameras.get(self.current_camera)
@@ -1997,6 +3429,7 @@ class OpenCvJsonlViewer:
         self.clear_image_cache()
         self.close_video_readers()
         self.video_keyframe_indexes.clear()
+        self.reset_annotation_state()
         self.store = new_store
         self.current_jsonl_path = resource_to_text(jsonl_path)
         self.refresh_camera_choices()
@@ -2542,6 +3975,14 @@ class OpenCvJsonlViewer:
                     self.handle_image_frame_result(result)
                 elif kind == "image_prefetch":
                     self.handle_image_prefetch_result(result)
+                elif kind == "annotation_save":
+                    self.handle_annotation_save_result(result)
+                elif kind == "annotation_save_progress":
+                    self.handle_annotation_save_progress(result)
+                elif kind == "annotation_work_progress":
+                    self.handle_annotation_work_progress(result)
+                elif kind == "annotation_work_done":
+                    self.handle_annotation_work_done(result)
         except queue.Empty:
             pass
 
@@ -2861,9 +4302,22 @@ class OpenCvJsonlViewer:
         frame_number = int(round(self.progress_var.get()))
         frame_number = max(1, min(frame_number, len(annotation.items)))
         self.progress_var.set(frame_number)
+        if not self.confirm_unsaved_annotation_navigation(
+            "切帧",
+            "seek",
+            frame_number - 1,
+        ):
+            return
         self.seek_and_render(frame_number - 1)
 
     def open_camera(self, camera_id: int, target_pts: int | None = None) -> None:
+        if camera_id != self.current_camera and not self.confirm_unsaved_annotation_navigation(
+            "切相机",
+            "open_camera",
+            camera_id,
+            target_pts,
+        ):
+            return
         self.is_playing = False
         self.cancel_video_task()
         if not self.store.cameras:
@@ -2907,6 +4361,11 @@ class OpenCvJsonlViewer:
         return self.mode_var.get() == "视频模式"
 
     def change_mode(self) -> None:
+        if not self.confirm_unsaved_annotation_navigation(
+            "切换模式",
+            "change_mode",
+        ):
+            return
         self.is_playing = False
         self.current_raw_frame = None
         self.clear_video_cache()
@@ -2928,6 +4387,23 @@ class OpenCvJsonlViewer:
             return
         current_pts = self.current_display_pts()
         self.open_camera(camera_id, target_pts=current_pts)
+
+    def get_frame_step(self) -> int:
+        try:
+            step = int(self.frame_step_var.get())
+        except ValueError:
+            messagebox.showerror("输入错误", "步长必须是正整数")
+            self.frame_step_var.set(str(DEFAULT_FRAME_STEP))
+            return DEFAULT_FRAME_STEP
+        if step < 1:
+            messagebox.showerror("输入错误", "步长必须大于等于 1")
+            self.frame_step_var.set(str(DEFAULT_FRAME_STEP))
+            return DEFAULT_FRAME_STEP
+        if step > 10000:
+            messagebox.showerror("输入错误", "步长过大，建议不超过 10000")
+            step = 10000
+        self.frame_step_var.set(str(step))
+        return step
 
     def toggle_play(self) -> None:
         if not self.is_video_mode():
@@ -2963,15 +4439,23 @@ class OpenCvJsonlViewer:
 
     def prev_frame(self) -> None:
         self.is_playing = False
-        self.seek_and_render(self.current_index - 1)
+        target_index = self.current_index - self.get_frame_step()
+        if not self.confirm_unsaved_annotation_navigation("切帧", "seek", target_index):
+            return
+        self.seek_and_render(target_index)
 
     def first_frame(self) -> None:
         self.is_playing = False
+        if not self.confirm_unsaved_annotation_navigation("切帧", "seek", 0):
+            return
         self.seek_and_render(0)
 
     def next_frame(self) -> None:
         self.is_playing = False
-        self.seek_and_render(self.current_index + 1)
+        target_index = self.current_index + self.get_frame_step()
+        if not self.confirm_unsaved_annotation_navigation("切帧", "seek", target_index):
+            return
+        self.seek_and_render(target_index)
 
     def jump_frame(self) -> None:
         self.is_playing = False
@@ -2980,7 +4464,10 @@ class OpenCvJsonlViewer:
         except ValueError:
             messagebox.showerror("输入错误", "帧序号必须是整数")
             return
-        self.seek_and_render(frame_number - 1)
+        target_index = frame_number - 1
+        if not self.confirm_unsaved_annotation_navigation("切帧", "seek", target_index):
+            return
+        self.seek_and_render(target_index)
 
     def jump_pts(self) -> None:
         self.is_playing = False
@@ -2990,7 +4477,10 @@ class OpenCvJsonlViewer:
             messagebox.showerror("输入错误", "PTS 必须是整数")
             return
         annotation = self.get_annotation()
-        self.seek_and_render(nearest_index_by_pts(annotation, pts))
+        target_index = nearest_index_by_pts(annotation, pts)
+        if not self.confirm_unsaved_annotation_navigation("切帧", "seek", target_index):
+            return
+        self.seek_and_render(target_index)
 
     def apply_display_settings(self) -> None:
         try:
@@ -3026,7 +4516,7 @@ class OpenCvJsonlViewer:
     def sync_video_scale_from_size(self, width: int, height: int) -> None:
         width_scale = width / DISPLAY_WIDTH
         height_scale = height / DISPLAY_HEIGHT
-        scale = min(max((width_scale + height_scale) / 2, 0.25), 1.2)
+        scale = min(max((width_scale + height_scale) / 2, 0.25), 2.0)
         self.video_scale_var.set(scale)
         self.video_scale_text_var.set(f"{scale:.2f}")
 
@@ -3105,6 +4595,13 @@ class OpenCvJsonlViewer:
         self.seek_and_render(target_index)
 
     def seek_and_render(self, frame_index: int) -> None:
+        if (
+            self.annotation_mode_enabled
+            and self.annotation_dirty
+            and self.annotation_save_after_id is None
+            and not self.annotation_saving
+        ):
+            self.start_annotation_save_worker()
         annotation = self.get_annotation()
         if not annotation.items:
             return
@@ -3224,6 +4721,12 @@ class OpenCvJsonlViewer:
             ),
         )
         item = annotation.items[json_index]
+        item_annotation_key = self.annotation_key_from_item(item, self.current_camera)
+        deleted_ball_indices = (
+            self.deleted_original_ball_indices.get(item_annotation_key, set())
+            if item_annotation_key is not None
+            else set()
+        )
         pts = annotation.pts_values[self.current_index]
         json_pts = annotation.pts_values[json_index]
 
@@ -3255,7 +4758,16 @@ class OpenCvJsonlViewer:
             det_threshold=self.current_det_threshold,
             team_score_threshold=self.current_team_score_threshold,
             id_score_threshold=self.current_id_score_threshold,
+            deleted_ball_indices=deleted_ball_indices,
         )
+        if self.show_balls.get() or self.annotation_mode_enabled:
+            draw_manual_ball_annotations(
+                display_frame,
+                self.current_frame_manual_balls(),
+                scale_x,
+                scale_y,
+                label_scale,
+            )
         self.draw_overlay_header(
             display_frame, item, pts, json_index, json_pts, label_scale
         )
@@ -3266,6 +4778,22 @@ class OpenCvJsonlViewer:
         players_text = detection_count_text(result, "players", "players")
         balls_text = detection_count_text(result, "balls", "balls")
         schema_status = "result 缺失 | " if result_missing else ""
+        manual_count = len(self.current_frame_manual_balls())
+        deleted_count = len(deleted_ball_indices)
+        annotation_status = ""
+        if self.annotation_mode_enabled:
+            work_name = (
+                display_resource_name(self.annotation_work_path)
+                if self.annotation_work_path is not None
+                else "未创建"
+            )
+            save_state = "保存中" if self.annotation_saving else "已保存"
+            if self.annotation_dirty:
+                save_state = "待保存" if not self.annotation_saving else "保存中"
+            annotation_status = (
+                f"人工球框 {manual_count} | 删除原框 {deleted_count} | "
+                f"标注{save_state} | 标注文件 {work_name} | "
+            )
         threshold_status = ""
         if self.label_mode_var.get() == "排错模式":
             threshold_status = (
@@ -3289,6 +4817,7 @@ class OpenCvJsonlViewer:
             f"图片 PTS {pts} | JSON偏移 {self.json_offset_frames:+d} | "
             f"JSON帧 {json_index + 1}/{len(annotation.items)} | JSON PTS {json_pts} | "
             f"{schema_status}{players_text} | {balls_text} | "
+            f"{annotation_status}"
             f"原始尺寸 {frame_w}x{frame_h} -> 显示尺寸 {self.display_width}x{self.display_height} | "
             f"标签 {self.label_mode_var.get()} | "
             f"{threshold_status}"
@@ -3353,10 +4882,111 @@ class OpenCvJsonlViewer:
         self.video_canvas.yview_moveto(yview[0])
 
     def on_canvas_press(self, event: tk.Event) -> None:
+        if self.annotation_mode_enabled:
+            if self.current_raw_frame is None:
+                return
+            x = self.video_canvas.canvasx(event.x)
+            y = self.video_canvas.canvasy(event.y)
+            x = max(0.0, min(float(self.display_width), float(x)))
+            y = max(0.0, min(float(self.display_height), float(y)))
+            self.annotation_drag_start = (x, y)
+            if self.annotation_preview_rect_id is not None:
+                self.video_canvas.delete(self.annotation_preview_rect_id)
+            self.annotation_preview_rect_id = self.video_canvas.create_rectangle(
+                x,
+                y,
+                x,
+                y,
+                outline="#ff00ff",
+                width=2,
+            )
+            return
         self.video_canvas.scan_mark(event.x, event.y)
 
     def on_canvas_drag(self, event: tk.Event) -> None:
+        if self.annotation_mode_enabled:
+            if (
+                self.annotation_drag_start is None
+                or self.annotation_preview_rect_id is None
+            ):
+                return
+            x = self.video_canvas.canvasx(event.x)
+            y = self.video_canvas.canvasy(event.y)
+            x = max(0.0, min(float(self.display_width), float(x)))
+            y = max(0.0, min(float(self.display_height), float(y)))
+            start_x, start_y = self.annotation_drag_start
+            self.video_canvas.coords(
+                self.annotation_preview_rect_id,
+                start_x,
+                start_y,
+                x,
+                y,
+            )
+            return
         self.video_canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def on_canvas_release(self, event: tk.Event) -> None:
+        if not self.annotation_mode_enabled:
+            return
+        if self.annotation_drag_start is None or self.current_raw_frame is None:
+            self.cancel_annotation_drag()
+            return
+
+        start_x, start_y = self.annotation_drag_start
+        end_x = self.video_canvas.canvasx(event.x)
+        end_y = self.video_canvas.canvasy(event.y)
+        end_x = max(0.0, min(float(self.display_width), float(end_x)))
+        end_y = max(0.0, min(float(self.display_height), float(end_y)))
+        self.cancel_annotation_drag()
+
+        display_x1, display_x2 = sorted((start_x, end_x))
+        display_y1, display_y2 = sorted((start_y, end_y))
+        if (
+            display_x2 - display_x1 < MIN_ANNOTATION_BOX_SIZE
+            or display_y2 - display_y1 < MIN_ANNOTATION_BOX_SIZE
+        ):
+            self.status_var.set("标注框太小，已忽略")
+            return
+
+        frame_h, frame_w = self.current_raw_frame.shape[:2]
+        scale_x = self.display_width / frame_w
+        scale_y = self.display_height / frame_h
+        bbox = [
+            int(round(display_x1 / scale_x)),
+            int(round(display_y1 / scale_y)),
+            int(round(display_x2 / scale_x)),
+            int(round(display_y2 / scale_y)),
+        ]
+        bbox[0] = max(0, min(frame_w - 1, bbox[0]))
+        bbox[1] = max(0, min(frame_h - 1, bbox[1]))
+        bbox[2] = max(0, min(frame_w - 1, bbox[2]))
+        bbox[3] = max(0, min(frame_h - 1, bbox[3]))
+        if bbox[2] - bbox[0] < MIN_ANNOTATION_BOX_SIZE or bbox[3] - bbox[1] < MIN_ANNOTATION_BOX_SIZE:
+            self.status_var.set("标注框太小，已忽略")
+            return
+
+        key = self.current_annotation_key()
+        if key is None:
+            return
+        ball = {
+            "bbox": bbox,
+            "score": MANUAL_BALL_SCORE,
+        }
+        self.manual_ball_annotations.setdefault(key, []).append(ball)
+        if self.mark_annotation_dirty_and_save(key):
+            self.status_var.set(
+                f"已新增人工球框，标注未保存：{self.annotation_work_path}"
+            )
+        self.render_current()
+
+    def on_canvas_right_click(self, event: tk.Event) -> None:
+        if not self.annotation_mode_enabled:
+            return
+        x = self.video_canvas.canvasx(event.x)
+        y = self.video_canvas.canvasy(event.y)
+        x = max(0.0, min(float(self.display_width), float(x)))
+        y = max(0.0, min(float(self.display_height), float(y)))
+        self.delete_ball_at_canvas_point(x, y)
 
     def on_canvas_mousewheel(self, event: tk.Event) -> None:
         units = int(-1 * (event.delta / 120)) if event.delta else 0
@@ -3374,6 +5004,29 @@ class OpenCvJsonlViewer:
         self.json_text.configure(state=tk.DISABLED)
 
     def close(self) -> None:
+        if self.annotation_dirty:
+            answer = messagebox.askyesnocancel(
+                "标注尚未保存",
+                "当前标注 JSONL 有未保存改动，关闭页面前是否保存？\n\n"
+                "选择「是」：保存完成后关闭。\n"
+                "选择「否」：不保存并直接关闭。\n"
+                "选择「取消」：返回页面。",
+            )
+            if answer is None:
+                return
+            if answer:
+                self.close_after_annotation_save = True
+                if self.annotation_save_after_id is not None:
+                    self.root.after_cancel(self.annotation_save_after_id)
+                    self.annotation_save_after_id = None
+                if self.annotation_saving:
+                    self.status_var.set("标注 JSONL 正在保存中，保存完成后会自动关闭页面")
+                else:
+                    self.start_annotation_save_worker()
+                return
+        self.close_without_annotation_prompt()
+
+    def close_without_annotation_prompt(self) -> None:
         if self.jsonl_cancel_event is not None:
             self.jsonl_cancel_event.set()
         self.cancel_image_prefetch_task()
