@@ -95,7 +95,7 @@ VIDEO_RESULT_POLL_MS = 30
 
 # 网络图片模式预加载范围。只对 tos/http 图片目录生效。
 IMAGE_PREFETCH_BEFORE = 12
-IMAGE_PREFETCH_AFTER = 100
+IMAGE_PREFETCH_AFTER = 70
 IMAGE_CACHE_MAX_FRAMES = 300
 IMAGE_CONCURRENT_DOWNLOADS = 16
 
@@ -1314,13 +1314,13 @@ def draw_detections(
 
     if show_balls:
         balls, _balls_state = detection_list_from_result(result, "balls")
+        deleted_set = deleted_ball_indices or set()
         original_ball_index = -1
-        deleted_ball_indices = deleted_ball_indices or set()
         for ball in balls:
             if is_manual_ball(ball):
                 continue
             original_ball_index += 1
-            if original_ball_index in deleted_ball_indices:
+            if original_ball_index in deleted_set:
                 continue
             bbox_rect = scaled_bbox(ball.get("bbox"), scale_x, scale_y)
             if bbox_rect is None:
@@ -1497,7 +1497,7 @@ class OpenCvJsonlViewer:
         self.image_prefetch_widgets: list[tk.Widget] = []
         self.manual_ball_annotations: dict[tuple[int, int], list[dict[str, Any]]] = {}
         self.deleted_original_ball_indices: dict[tuple[int, int], set[int]] = {}
-        self.deleted_original_ball_history: dict[tuple[int, int], list[int]] = {}
+        self.deleted_original_ball_history: dict[tuple[int, int], list[tuple[int, float]]] = {}
         self.annotation_output_lines: list[str] = []
         self.annotation_key_to_output_indices: dict[tuple[int, int], list[int]] = {}
         self.annotation_output_entries: list[tuple[int, dict[str, Any]]] = []
@@ -2438,10 +2438,12 @@ class OpenCvJsonlViewer:
                     (
                         manual_annotations,
                         deleted_original_ball_indices,
+                        deleted_ball_history,
                     ) = self.read_annotation_work_file_data(selected_path, progress_cb)
                 else:
                     manual_annotations = manual_snapshot
                     deleted_original_ball_indices = deleted_snapshot
+                    deleted_ball_history = None  # create 模式不需要 history
                 (
                     output_lines,
                     key_to_output_indices,
@@ -2469,6 +2471,7 @@ class OpenCvJsonlViewer:
                     "error": error,
                     "manual_annotations": manual_annotations,
                     "deleted_original_ball_indices": deleted_original_ball_indices,
+                    "deleted_ball_history": deleted_ball_history,
                     "output_lines": output_lines,
                     "key_to_output_indices": key_to_output_indices,
                     "output_entries": output_entries,
@@ -2486,6 +2489,7 @@ class OpenCvJsonlViewer:
     ) -> tuple[
         dict[tuple[int, int], list[dict[str, Any]]],
         dict[tuple[int, int], set[int]],
+        dict[tuple[int, int], list[tuple[int, float]]],
     ]:
         file_size = path.stat().st_size if path.is_file() else 0
         bytes_read = 0
@@ -2535,10 +2539,12 @@ class OpenCvJsonlViewer:
 
         if progress_callback:
             progress_callback(96, "分析被删除的原始球框")
-        deleted = self.infer_deleted_original_balls(kept_original_signatures, work_keys)
+        deleted, deleted_history = self.infer_deleted_original_balls(
+            kept_original_signatures, work_keys
+        )
         if progress_callback:
             progress_callback(100, f"{total_lines} 行")
-        return loaded, deleted
+        return loaded, deleted, deleted_history
 
     def sorted_annotation_items(self) -> list[tuple[int, int, int, dict[str, Any]]]:
         items: list[tuple[int, int, int, dict[str, Any]]] = []
@@ -2669,10 +2675,14 @@ class OpenCvJsonlViewer:
             self.deleted_original_ball_indices = (
                 result.get("deleted_original_ball_indices") or {}
             )
-            self.deleted_original_ball_history = {
-                key: list(sorted(indices))
-                for key, indices in self.deleted_original_ball_indices.items()
-            }
+            loaded_history = result.get("deleted_ball_history")
+            if loaded_history is not None:
+                self.deleted_original_ball_history = loaded_history
+            else:
+                self.deleted_original_ball_history = {
+                    key: [(idx, 0.0) for idx in sorted(indices)]
+                    for key, indices in self.deleted_original_ball_indices.items()
+                }
             action_text = "已载入标注 JSONL"
         else:
             action_text = "已创建标注工作 JSONL"
@@ -2781,20 +2791,32 @@ class OpenCvJsonlViewer:
         if self.annotation_work_path is None or not self.annotation_work_path.is_file():
             return
 
-        loaded, deleted = self.read_annotation_work_file_data(self.annotation_work_path)
+        loaded, deleted, history = self.read_annotation_work_file_data(
+            self.annotation_work_path
+        )
         self.manual_ball_annotations = loaded
         self.deleted_original_ball_indices = deleted
-        self.deleted_original_ball_history = {
-            key: list(sorted(indices))
-            for key, indices in self.deleted_original_ball_indices.items()
-        }
+        if history is not None:
+            self.deleted_original_ball_history = history
+        else:
+            self.deleted_original_ball_history = {
+                key: [(idx, 0.0) for idx in sorted(indices)]
+                for key, indices in self.deleted_original_ball_indices.items()
+            }
 
     def infer_deleted_original_balls(
         self,
         kept_original_signatures: dict[tuple[int, int], Counter[str]],
         work_keys: set[tuple[int, int]],
-    ) -> dict[tuple[int, int], set[int]]:
+    ) -> tuple[dict[tuple[int, int], set[int]], dict[tuple[int, int], list[tuple[int, float]]]]:
+        """从已加载的标注 JSONL 推断被删除的原始球框。
+
+        对比原始 JSONL 和标注 JSONL 中非人工球签名的差异。
+        缺失的球被视为已删除，记录其索引和原始 score 以便撤回。
+        返回 (deleted_indices, deleted_history)。
+        """
         deleted: dict[tuple[int, int], set[int]] = {}
+        history: dict[tuple[int, int], list[tuple[int, float]]] = {}
         for camera_id, annotation in self.store.cameras.items():
             for item in annotation.items:
                 key = self.annotation_key_from_item(item, camera_id)
@@ -2811,7 +2833,10 @@ class OpenCvJsonlViewer:
                         kept[signature] -= 1
                         continue
                     deleted.setdefault(key, set()).add(index)
-        return deleted
+                    history.setdefault(key, []).append(
+                        (index, safe_score(ball.get("score")))
+                    )
+        return deleted, history
 
     def save_annotation_work_if_dirty(self) -> None:
         if not self.annotation_dirty:
@@ -3107,7 +3132,7 @@ class OpenCvJsonlViewer:
         item: dict[str, Any],
         fallback_camera_id: int,
         manual_annotations: dict[tuple[int, int], list[dict[str, Any]]],
-        deleted_original_ball_indices: dict[tuple[int, int], set[int]],
+        deleted_original_ball_indices: dict[tuple[int, int], set[int]] | None = None,
     ) -> dict[str, Any]:
         output_item = deepcopy(item)
         result, _missing = result_dict_from_item(output_item)
@@ -3121,16 +3146,19 @@ class OpenCvJsonlViewer:
         original_balls, _state = detection_list_from_result(result, "balls")
         deleted_indices = (
             deleted_original_ball_indices.get(manual_key, set())
-            if manual_key is not None
+            if manual_key is not None and deleted_original_ball_indices is not None
             else set()
         )
-        copied_original_balls = [
-            deepcopy(ball)
-            for index, ball in enumerate(
-                ball for ball in original_balls if not is_manual_ball(ball)
-            )
-            if index not in deleted_indices
-        ]
+        copied_original_balls: list[dict[str, Any]] = []
+        original_idx = -1
+        for ball in original_balls:
+            if is_manual_ball(ball):
+                continue
+            original_idx += 1
+            copied_ball = deepcopy(ball)
+            if original_idx in deleted_indices:
+                copied_ball["score"] = 0
+            copied_original_balls.append(copied_ball)
         manual_balls = (
             [deepcopy(ball) for ball in manual_annotations.get(manual_key, [])]
             if manual_key is not None
@@ -3188,7 +3216,7 @@ class OpenCvJsonlViewer:
         if not history:
             self.status_var.set("当前帧没有可撤回的原始球框删除")
             return
-        index = history.pop()
+        index, _original_score = history.pop()
         deleted_indices = self.deleted_original_ball_indices.get(key)
         if deleted_indices is not None:
             deleted_indices.discard(index)
@@ -3196,6 +3224,7 @@ class OpenCvJsonlViewer:
                 self.deleted_original_ball_indices.pop(key, None)
         if not history:
             self.deleted_original_ball_history.pop(key, None)
+
         if self.mark_annotation_dirty_and_save(key):
             self.status_var.set(
                 f"已撤回原始球框删除，标注未保存：{self.annotation_work_path}"
@@ -3301,11 +3330,12 @@ class OpenCvJsonlViewer:
             self.render_current()
             return
 
+        # 不修改原始 item；只记录追踪信息
         self.deleted_original_ball_indices.setdefault(key, set()).add(index)
-        self.deleted_original_ball_history.setdefault(key, []).append(index)
+        self.deleted_original_ball_history.setdefault(key, []).append((index, 0.0))
         if self.mark_annotation_dirty_and_save(key):
             self.status_var.set(
-                f"已删除原始球框 {index + 1}，标注未保存：{self.annotation_work_path}"
+                f"已删除原始球框 {index + 1}（score→0），标注未保存：{self.annotation_work_path}"
             )
         self.render_current()
 
@@ -3333,7 +3363,7 @@ class OpenCvJsonlViewer:
         scale_x = self.display_width / frame_w
         scale_y = self.display_height / frame_h
         deleted_indices = self.deleted_original_ball_indices.get(key, set())
-        candidates: list[tuple[float, int]] = []
+        candidates: list[tuple[float, int, float]] = []
         original_index = -1
         for ball in balls:
             if is_manual_ball(ball):
@@ -3347,18 +3377,24 @@ class OpenCvJsonlViewer:
             x1, y1, x2, y2 = bbox_rect
             if x1 <= canvas_x <= x2 and y1 <= canvas_y <= y2:
                 area = max(1, (x2 - x1) * (y2 - y1))
-                candidates.append((area, original_index))
+                candidates.append((area, original_index, safe_score(ball.get("score"))))
 
         if not candidates:
             self.status_var.set("右键位置没有可删除的原始球框")
             return
 
-        _area, original_index = min(candidates, key=lambda item: item[0])
+        _area, original_index, original_score = min(
+            candidates, key=lambda item: item[0]
+        )
+        # 不修改原始 item；只记录追踪信息，在 build_annotation_work_item 中设 score=0
         self.deleted_original_ball_indices.setdefault(key, set()).add(original_index)
-        self.deleted_original_ball_history.setdefault(key, []).append(original_index)
+        self.deleted_original_ball_history.setdefault(key, []).append(
+            (original_index, original_score)
+        )
+
         if self.mark_annotation_dirty_and_save(key):
             self.status_var.set(
-                f"已删除原始球框 {original_index + 1}，标注未保存：{self.annotation_work_path}"
+                f"已删除原始球框 {original_index + 1}（score→0），标注未保存：{self.annotation_work_path}"
             )
         self.render_current()
 
@@ -5139,6 +5175,8 @@ class OpenCvJsonlViewer:
             if self.is_annotation_work_mode()
             else None
         )
+        # item 来自原始 JSONL，从未被标注删除操作修改；
+        # build_annotation_work_item 在 deepcopy 上设 score=0，不影响 item
         self.show_json(item, annotation_json_item)
 
         result, result_missing = result_dict_from_item(item)
@@ -5146,7 +5184,10 @@ class OpenCvJsonlViewer:
         balls_text = detection_count_text(result, "balls", "balls")
         schema_status = "result 缺失 | " if result_missing else ""
         manual_count = len(self.current_frame_manual_balls())
-        deleted_count = len(deleted_ball_indices)
+        deleted_indices = self.deleted_original_ball_indices.get(
+            self.current_annotation_key(), set()
+        )
+        deleted_count = len(deleted_indices)
         annotation_status = ""
         if self.annotation_mode_enabled:
             work_name = (
