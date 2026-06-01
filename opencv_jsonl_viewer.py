@@ -5100,7 +5100,7 @@ class OpenCvJsonlViewer:
                 scale_y,
                 label_scale,
             )
-        if not self.is_view_work_mode():
+        if self.is_inspect_work_mode():
             self.draw_overlay_header(
                 display_frame, item, pts, json_index, json_pts, label_scale
             )
