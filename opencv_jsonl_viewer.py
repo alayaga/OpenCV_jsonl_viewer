@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 import json
 import os
@@ -94,8 +95,9 @@ VIDEO_RESULT_POLL_MS = 30
 
 # 网络图片模式预加载范围。只对 tos/http 图片目录生效。
 IMAGE_PREFETCH_BEFORE = 12
-IMAGE_PREFETCH_AFTER = 36
+IMAGE_PREFETCH_AFTER = 100
 IMAGE_CACHE_MAX_FRAMES = 300
+IMAGE_CONCURRENT_DOWNLOADS = 16
 
 # 排错模式下的异常阈值。
 ABNORMAL_DET_THRESHOLD = 0.60
@@ -4065,20 +4067,11 @@ class OpenCvJsonlViewer:
 
         def worker() -> None:
             errors = 0
-            for idx in missing_indices:
+
+            def download_one(idx: int) -> dict[str, Any]:
+                """下载单帧图片，返回结果字典。stale 表示 token 已过期。"""
                 if not self.is_image_prefetch_current(token, camera_id):
-                    self.video_result_queue.put(
-                        {
-                            "kind": "image_prefetch",
-                            "token": token,
-                            "camera_id": camera_id,
-                            "center_index": center_index,
-                            "pending_keys": pending_keys,
-                            "errors": errors,
-                            "cancelled": True,
-                        }
-                    )
-                    return
+                    return {"idx": idx, "frame": None, "error": True, "stale": True}
                 pts = pts_values[idx]
                 image_resource = join_resource(
                     frame_image_dir, str(camera_id), f"{pts}.jpg"
@@ -4086,33 +4079,24 @@ class OpenCvJsonlViewer:
                 try:
                     frame = self.fetch_remote_image_frame(image_resource)
                 except Exception:
-                    errors += 1
-                    self.video_result_queue.put(
-                        {
-                            "kind": "image_frame",
-                            "token": token,
-                            "camera_id": camera_id,
-                            "frame_index": idx,
-                            "center_index": center_index,
-                            "frame": None,
-                            "error": True,
-                        }
-                    )
-                    continue
+                    return {"idx": idx, "frame": None, "error": True, "stale": False}
                 if frame is not None:
-                    self.video_result_queue.put(
-                        {
-                            "kind": "image_frame",
-                            "token": token,
-                            "camera_id": camera_id,
-                            "frame_index": idx,
-                            "center_index": center_index,
-                            "frame": frame,
-                            "error": False,
-                        }
-                    )
+                    return {"idx": idx, "frame": frame, "error": False, "stale": False}
                 else:
-                    errors += 1
+                    return {"idx": idx, "frame": None, "error": True, "stale": False}
+
+            max_workers = min(IMAGE_CONCURRENT_DOWNLOADS, len(missing_indices))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(download_one, idx) for idx in missing_indices
+                ]
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result.get("stale"):
+                        continue
+                    idx = result["idx"]
+                    if result.get("error"):
+                        errors += 1
                     self.video_result_queue.put(
                         {
                             "kind": "image_frame",
@@ -4120,8 +4104,8 @@ class OpenCvJsonlViewer:
                             "camera_id": camera_id,
                             "frame_index": idx,
                             "center_index": center_index,
-                            "frame": None,
-                            "error": True,
+                            "frame": result.get("frame"),
+                            "error": result.get("error", False),
                         }
                     )
 
@@ -4139,6 +4123,42 @@ class OpenCvJsonlViewer:
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
+
+    def _ensure_image_cache_ahead(self, current_index: int) -> None:
+        """播放时主动检查前方缓存余量，不足则触发预取向前扩展窗口。
+
+        与 maybe_prefetch_image_frames 的区别：
+        - maybe_prefetch 以 center 为中心检查其前后窗口是否有缺失帧，
+          若窗口内缓存已满则直接返回（不做事）。
+        - 本方法专门处理「当前窗口已满但前方即将耗尽」的情况，
+          计算步长对齐的连续前向缓存帧数，低于阈值时以第一个未缓存的
+          位置为中心触发 maybe_prefetch_image_frames。
+        """
+        if not self.is_network_image_mode():
+            return
+        if self.image_prefetching:
+            return
+        try:
+            annotation = self.get_annotation()
+        except KeyError:
+            return
+        if not annotation.items:
+            return
+
+        step = self.cache_frame_step()
+        total = len(annotation.items)
+
+        # 统计从 current_index 起步长对齐的连续已缓存帧数
+        ahead = 0
+        probe = current_index + step
+        while probe < total and (self.current_camera, probe) in self.image_frame_cache:
+            ahead += 1
+            probe += step
+
+        # 前方连续缓存低于半个预载后窗时，从第一个缺口位置向前补充
+        min_ahead = max(1, self.image_prefetch_after // 2)
+        if ahead < min_ahead and probe < total:
+            self.maybe_prefetch_image_frames(probe)
 
     def handle_image_frame_result(self, result: dict[str, Any]) -> None:
         token = int(result["token"])
@@ -4165,6 +4185,7 @@ class OpenCvJsonlViewer:
                 self.current_raw_frame = frame
                 self.image_pending_render_index = None
                 self.render_frame(frame)
+                self._ensure_image_cache_ahead(frame_index)
         self.update_cache_status()
 
     def handle_image_prefetch_result(self, result: dict[str, Any]) -> None:
@@ -4184,6 +4205,7 @@ class OpenCvJsonlViewer:
             else self.current_index
         )
         self.maybe_prefetch_image_frames(next_target)
+        self._ensure_image_cache_ahead(self.current_index)
 
     def close_video_readers(self) -> None:
         for reader in self.video_readers.values():
@@ -4746,6 +4768,7 @@ class OpenCvJsonlViewer:
             return
 
         self.seek_and_render(next_index)
+        self._ensure_image_cache_ahead(self.current_index)
         self.root.after(PLAY_INTERVAL_MS, self.play_tick)
 
     def prev_frame(self) -> None:
@@ -4950,6 +4973,7 @@ class OpenCvJsonlViewer:
         self.current_index = frame_index
         self.current_raw_frame = frame
         self.render_frame(frame)
+        self._ensure_image_cache_ahead(frame_index)
 
     def render_current(self) -> None:
         if self.video_loading and self.current_raw_frame is None:
