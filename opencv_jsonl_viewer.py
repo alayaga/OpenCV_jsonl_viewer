@@ -1517,6 +1517,7 @@ class OpenCvJsonlViewer:
         self.annotation_save_error: str | None = None
         self.annotation_drag_start: tuple[float, float] | None = None
         self.annotation_preview_rect_id: int | None = None
+        self.annotation_pan_mode: bool = False
         self.json_offset_frames = 0
         self.is_updating_progress = False
         self.is_playing = False
@@ -2012,14 +2013,15 @@ class OpenCvJsonlViewer:
         self.video_canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.video_canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         self.video_canvas.bind("<ButtonRelease-3>", self.on_canvas_right_click)
+        self.video_canvas.bind("<Double-Button-1>", self.on_canvas_double_click)
         self.video_canvas.bind("<MouseWheel>", self.on_canvas_mousewheel)
 
         hint = ttk.Label(
             left,
             text=(
                 "快捷键：空格播放/暂停，← 后退步长，→ 前进步长，q 退出；"
-                "观看/检查模式左键拖动画面，开启球标注后左键拖框、右键删除球框，"
-                "滚轮上下移动，Shift+滚轮左右移动"
+                "观看/检查模式左键拖动画面，开启球标注后左键拖框、右键删除球框、"
+                "双击左键切换平移模式，滚轮上下移动，Shift+滚轮左右移动"
             ),
             anchor="center",
         )
@@ -2262,6 +2264,7 @@ class OpenCvJsonlViewer:
             self.root.after_cancel(self.annotation_save_after_id)
             self.annotation_save_after_id = None
         self.annotation_mode_enabled = False
+        self.annotation_pan_mode = False
         self.manual_ball_annotations.clear()
         self.deleted_original_ball_indices.clear()
         self.deleted_original_ball_history.clear()
@@ -2726,6 +2729,7 @@ class OpenCvJsonlViewer:
                         f"正在后台保存标注 JSONL：{self.annotation_work_path}"
                     )
             self.annotation_mode_enabled = False
+            self.annotation_pan_mode = False
             self.cancel_annotation_drag()
             self.update_annotation_buttons()
             self.render_current()
@@ -3548,20 +3552,35 @@ class OpenCvJsonlViewer:
         if self.jsonl_loading:
             messagebox.showinfo("正在加载", "JSONL 正在加载中，请稍候")
             return
-        args = parse_args()
-        video_dir = args.video_dir.expanduser().resolve()
-        frame_image_dir = normalize_local_or_remote_resource(args.frame_image_dir)
-        jsonl_path = normalize_local_or_remote_resource(args.jsonl, must_be_file=True)
 
-        if not is_remote_resource(jsonl_path) and not Path(jsonl_path).is_file():
-            messagebox.showerror(
-                "预设资源加载失败", f"找不到预设 JSONL 文件：\n{jsonl_path}"
-            )
+        PRESETS = [
+            {
+                "label": "数据集 A（20260526_164647）",
+                "image": "https://sense-omni.tos-cn-shanghai.volces.com/hocky/lym/data_saved/0526/label/top100/jpeg/20260526_164647/",
+                "jsonl": "https://sense-omni.tos-cn-shanghai.volces.com/hocky/lym/data_saved/0526/label/top100/jsonl/20260526_164647/output_no_players_top100.jsonl",
+            },
+            {
+                "label": "数据集 B（20260526_165340）",
+                "image": "https://sense-omni.tos-cn-shanghai.volces.com/hocky/lym/data_saved/0526/label/top100/jpeg/20260526_165340/",
+                "jsonl": "https://sense-omni.tos-cn-shanghai.volces.com/hocky/lym/data_saved/0526/label/top100/jsonl/20260526_165340/output_no_players_top100.jsonl",
+            },
+        ]
+
+        choice = simpledialog.askinteger(
+            "选择预设资源",
+            "请选择要加载的数据集（输入 1 或 2）：\n\n"
+            "1 — 数据集 A（20260526_164647）\n"
+            "2 — 数据集 B（20260526_165340）",
+            minvalue=1,
+            maxvalue=len(PRESETS),
+            parent=self.root,
+        )
+        if choice is None:
             return
 
-        self.video_dir = video_dir
-        self.frame_image_dir = frame_image_dir
-        self.start_jsonl_load(jsonl_path, preset_camera=args.camera)
+        preset = PRESETS[choice - 1]
+        self.frame_image_dir = preset["image"]
+        self.start_jsonl_load(preset["jsonl"], preset_camera=DEFAULT_CAMERA)
 
     def update_jsonl_load_button_state(self) -> None:
         if self.cancel_jsonl_load_button is None:
@@ -5289,7 +5308,26 @@ class OpenCvJsonlViewer:
         self.video_canvas.xview_moveto(xview[0])
         self.video_canvas.yview_moveto(yview[0])
 
+    def on_canvas_double_click(self, event: tk.Event) -> None:
+        """标注模式下双击左键进入/退出画面平移模式。"""
+        if not self.annotation_mode_enabled:
+            return
+        if self.annotation_pan_mode:
+            self.annotation_pan_mode = False
+            self.cancel_annotation_drag()
+            self.video_canvas.configure(cursor="crosshair")
+            self.status_var.set("已退出平移模式，恢复标注")
+        else:
+            self.annotation_pan_mode = True
+            self.cancel_annotation_drag()
+            self.video_canvas.scan_mark(event.x, event.y)
+            self.video_canvas.configure(cursor="fleur")
+            self.status_var.set("双击平移模式：拖动左键移动画面，双击恢复标注")
+
     def on_canvas_press(self, event: tk.Event) -> None:
+        if self.annotation_mode_enabled and self.annotation_pan_mode:
+            self.video_canvas.scan_mark(event.x, event.y)
+            return
         if self.annotation_mode_enabled:
             if self.current_raw_frame is None:
                 return
@@ -5312,6 +5350,9 @@ class OpenCvJsonlViewer:
         self.video_canvas.scan_mark(event.x, event.y)
 
     def on_canvas_drag(self, event: tk.Event) -> None:
+        if self.annotation_mode_enabled and self.annotation_pan_mode:
+            self.video_canvas.scan_dragto(event.x, event.y, gain=1)
+            return
         if self.annotation_mode_enabled:
             if (
                 self.annotation_drag_start is None
@@ -5335,6 +5376,8 @@ class OpenCvJsonlViewer:
 
     def on_canvas_release(self, event: tk.Event) -> None:
         if not self.annotation_mode_enabled:
+            return
+        if self.annotation_pan_mode:
             return
         if self.annotation_drag_start is None or self.current_raw_frame is None:
             self.cancel_annotation_drag()
