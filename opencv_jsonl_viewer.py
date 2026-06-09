@@ -653,6 +653,7 @@ def load_annotations(
     bad_lines = 0
     player_count = 0
     ball_count = 0
+    manual_ball_found = False
     camera_line_counts: dict[int, int] = defaultdict(int)
     bytes_read = 0
     last_report = 0
@@ -665,6 +666,7 @@ def load_annotations(
 
     def handle_line(line: str) -> None:
         nonlocal total_lines, bad_lines, player_count, ball_count
+        nonlocal manual_ball_found
         nonlocal bytes_read, last_report
 
         check_cancelled()
@@ -702,6 +704,11 @@ def load_annotations(
         balls, _balls_state = detection_list_from_result(result, "balls")
         player_count += len(players)
         ball_count += len(balls)
+        if not manual_ball_found:
+            for ball in balls:
+                if is_manual_ball(ball):
+                    manual_ball_found = True
+                    break
 
         if progress_callback and total_lines - last_report >= 500:
             last_report = total_lines
@@ -749,6 +756,7 @@ def load_annotations(
         "camera_line_counts": dict(sorted(camera_line_counts.items())),
         "player_count": player_count,
         "ball_count": ball_count,
+        "has_manual_balls": manual_ball_found,
     }
     print(f"JSONL 读取完成：{total_lines} 行，{len(store.cameras)} 路相机。")
     if progress_callback:
@@ -1237,6 +1245,7 @@ def draw_detections(
     team_score_threshold: float,
     id_score_threshold: float,
     deleted_ball_indices: set[int] | None = None,
+    show_manual_balls: bool = False,
 ) -> None:
     result, _result_missing = result_dict_from_item(item)
     box_thickness = max(1, int(round(label_scale * 3)))
@@ -1355,6 +1364,51 @@ def draw_detections(
                 label_x,
                 label_y,
                 BALL_COLOR_BGR,
+                font_scale=label_scale,
+                thickness=label_thickness,
+            )
+            occupied_labels.append(rect)
+
+    if show_manual_balls:
+        balls, _balls_state = detection_list_from_result(result, "balls")
+        manual_ball_index = 0
+        for ball in balls:
+            if not is_manual_ball(ball):
+                continue
+            manual_ball_index += 1
+            bbox_rect = scaled_bbox(ball.get("bbox"), scale_x, scale_y)
+            if bbox_rect is None:
+                continue
+
+            x1, y1, x2, y2 = bbox_rect
+            cv2.rectangle(
+                frame, (x1, y1), (x2, y2), MANUAL_BALL_COLOR_BGR, max(2, box_thickness + 1)
+            )
+            label = f"m_ball {manual_ball_index} {score_text(ball, 'score')}"
+            label_x, label_y = find_label_position(
+                frame,
+                label,
+                (x1, y1, x2, y2),
+                occupied_labels,
+                label_scale,
+                label_thickness,
+            )
+            rect = text_rect(
+                frame, label, label_x, label_y, label_scale, label_thickness
+            )
+            draw_leader_line(
+                frame,
+                (x1, y1, x2, y2),
+                rect,
+                MANUAL_BALL_COLOR_BGR,
+                max(1, label_thickness),
+            )
+            rect = draw_label(
+                frame,
+                label,
+                label_x,
+                label_y,
+                MANUAL_BALL_COLOR_BGR,
                 font_scale=label_scale,
                 thickness=label_thickness,
             )
@@ -1547,6 +1601,8 @@ class OpenCvJsonlViewer:
         self.show_players = tk.BooleanVar(value=True)
         self.show_balls = tk.BooleanVar(value=True)
         self.show_keypoints = tk.BooleanVar(value=False)
+        self.show_manual_balls = tk.BooleanVar(value=False)
+        self.manual_balls_checkbox: ttk.Checkbutton | None = None
         self.label_mode_var = tk.StringVar(value="详细模式")
         self.show_label_id = tk.BooleanVar(value=True)
         self.show_label_team = tk.BooleanVar(value=True)
@@ -1617,7 +1673,7 @@ class OpenCvJsonlViewer:
         common_row.columnconfigure(16, weight=1)
         resource_row.columnconfigure(9, weight=1)
         annotation_row.columnconfigure(8, weight=1)
-        inspect_row.columnconfigure(19, weight=1)
+        inspect_row.columnconfigure(20, weight=1)
         display_row.columnconfigure(8, weight=1)
         progress_row.columnconfigure(1, weight=1)
         self.threshold_row.columnconfigure(8, weight=1)
@@ -1789,6 +1845,14 @@ class OpenCvJsonlViewer:
             variable=self.show_keypoints,
             command=self.render_current,
         ).grid(row=0, column=2, padx=4)
+        self.manual_balls_checkbox = ttk.Checkbutton(
+            inspect_row,
+            text="manual_balls",
+            variable=self.show_manual_balls,
+            command=self.render_current,
+            state=tk.DISABLED,
+        )
+        self.manual_balls_checkbox.grid(row=0, column=3, padx=4)
 
         ttk.Label(display_row, text="视频大小").grid(row=0, column=0, padx=(0, 4))
         video_scale = ttk.Scale(
@@ -1817,7 +1881,7 @@ class OpenCvJsonlViewer:
             display_row, text="应用显示", command=self.apply_display_settings
         ).grid(row=0, column=7, padx=4)
 
-        ttk.Label(inspect_row, text="文字").grid(row=0, column=3, padx=(8, 2))
+        ttk.Label(inspect_row, text="文字").grid(row=0, column=4, padx=(8, 2))
         label_scale = ttk.Scale(
             inspect_row,
             from_=0.25,
@@ -1827,12 +1891,12 @@ class OpenCvJsonlViewer:
             command=self.on_label_scale_change,
             length=80,
         )
-        label_scale.grid(row=0, column=4, padx=2)
+        label_scale.grid(row=0, column=5, padx=2)
         ttk.Label(inspect_row, textvariable=self.label_scale_text_var, width=5).grid(
-            row=0, column=5, padx=(0, 2)
+            row=0, column=6, padx=(0, 2)
         )
 
-        ttk.Label(inspect_row, text="标签").grid(row=0, column=6, padx=(8, 2))
+        ttk.Label(inspect_row, text="标签").grid(row=0, column=7, padx=(8, 2))
         label_mode_box = ttk.Combobox(
             inspect_row,
             width=8,
@@ -1840,7 +1904,7 @@ class OpenCvJsonlViewer:
             values=["排错模式", "详细模式"],
             state="readonly",
         )
-        label_mode_box.grid(row=0, column=7, padx=2)
+        label_mode_box.grid(row=0, column=8, padx=2)
         label_mode_box.bind(
             "<<ComboboxSelected>>", lambda _event: self.on_label_mode_change()
         )
@@ -1853,7 +1917,7 @@ class OpenCvJsonlViewer:
             ("team_s", self.show_label_team_score),
             ("id_s", self.show_label_id_score),
         ]
-        for offset, (text, variable) in enumerate(option_specs, start=8):
+        for offset, (text, variable) in enumerate(option_specs, start=9):
             checkbox = ttk.Checkbutton(
                 inspect_row,
                 text=text,
@@ -1863,23 +1927,23 @@ class OpenCvJsonlViewer:
             checkbox.grid(row=0, column=offset, padx=1)
             self.label_option_widgets.append(checkbox)
 
-        ttk.Label(inspect_row, text="偏移").grid(row=0, column=13, padx=(8, 2))
+        ttk.Label(inspect_row, text="偏移").grid(row=0, column=14, padx=(8, 2))
         ttk.Button(
             inspect_row, text="←", width=3, command=lambda: self.step_json_offset(-1)
-        ).grid(row=0, column=14, padx=1)
+        ).grid(row=0, column=15, padx=1)
         json_offset_entry = ttk.Entry(
             inspect_row, width=5, textvariable=self.json_offset_var
         )
-        json_offset_entry.grid(row=0, column=15, padx=1)
+        json_offset_entry.grid(row=0, column=16, padx=1)
         json_offset_entry.bind("<Return>", lambda _event: self.apply_json_offset())
         ttk.Button(
             inspect_row, text="→", width=3, command=lambda: self.step_json_offset(1)
-        ).grid(row=0, column=16, padx=1)
+        ).grid(row=0, column=17, padx=1)
         ttk.Button(inspect_row, text="应用", command=self.apply_json_offset).grid(
-            row=0, column=17, padx=(4, 1)
+            row=0, column=18, padx=(4, 1)
         )
         ttk.Button(inspect_row, text="归零", command=self.reset_json_offset).grid(
-            row=0, column=18, padx=1
+            row=0, column=19, padx=1
         )
 
         ttk.Label(progress_row, text="播放进度").grid(row=0, column=0, padx=(0, 8))
@@ -2142,6 +2206,7 @@ class OpenCvJsonlViewer:
         self.reset_annotation_state()
         self.mode_var.set(INPUT_MODE_IMAGE)
         self.store = AnnotationStore()
+        self._update_manual_balls_checkbox_state()
         self.current_jsonl_path = ""
         self.frame_image_dir = ""
         self.current_camera = DEFAULT_CAMERA
@@ -3748,6 +3813,7 @@ class OpenCvJsonlViewer:
             f"{summary.get('total_lines', 0)} 行 | "
             f"{summary.get('camera_count', 0)} 路相机"
         )
+        self._update_manual_balls_checkbox_state()
         self.open_camera(camera_id)
         self.schedule_image_prefetch()
 
@@ -4928,6 +4994,15 @@ class OpenCvJsonlViewer:
         else:
             self.threshold_row.grid()
 
+    def _update_manual_balls_checkbox_state(self) -> None:
+        """根据当前 JSONL 是否包含 score=2 的球来启用/禁用 manual_balls 复选框。"""
+        if self.manual_balls_checkbox is None:
+            return
+        has = self.store.summary.get("has_manual_balls", False)
+        self.manual_balls_checkbox.configure(state=tk.NORMAL if has else tk.DISABLED)
+        if not has:
+            self.show_manual_balls.set(False)
+
     def apply_threshold_settings(self) -> None:
         try:
             det_threshold = float(self.det_threshold_var.get())
@@ -5140,14 +5215,17 @@ class OpenCvJsonlViewer:
             draw_players = False
             draw_balls = False
             draw_keypoints = False
+            draw_manual_balls = False
         elif self.is_annotation_work_mode():
             draw_players = False
             draw_balls = True
             draw_keypoints = False
+            draw_manual_balls = False
         else:
             draw_players = self.show_players.get()
             draw_balls = self.show_balls.get()
             draw_keypoints = self.show_keypoints.get()
+            draw_manual_balls = self.show_manual_balls.get()
 
         draw_detections(
             display_frame,
@@ -5168,6 +5246,7 @@ class OpenCvJsonlViewer:
             team_score_threshold=self.current_team_score_threshold,
             id_score_threshold=self.current_id_score_threshold,
             deleted_ball_indices=deleted_ball_indices,
+            show_manual_balls=draw_manual_balls,
         )
         if not self.is_view_work_mode() and (
             draw_balls or self.annotation_mode_enabled or self.is_annotation_work_mode()
