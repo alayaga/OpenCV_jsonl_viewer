@@ -59,10 +59,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
 
 # 输入视频目录：里面应包含 101.m3u8 ... 124.m3u8 或 101.ts ... 124.ts。
-VIDEO_DIR = "https://sense-omni.tos-cn-shanghai.volces.com/hocky/rba/video/segment2/"
+VIDEO_DIR = "https://sense-omni.tos-cn-shanghai.volces.com/hocky/lym/data_saved/match_24/video/segment1/"
 
 # 2D pipeline 输出的 JSONL。
-JSONL_PATH = "https://sense-omni.tos-cn-shanghai.volces.com/hocky/lym/data_saved/0526/output/jsonl_without_players/20260526_164647/output_0_no_players.jsonl"
+JSONL_PATH = "F:\TheHockeyProject\linyiming\output_0.jsonl"
 
 # 按 pts 命名的 JPEG 帧目录。
 FRAME_IMAGE_DIR = "https://sense-omni.tos-cn-shanghai.volces.com/hocky/lym/data_saved/0526/frame_clips/20260526_164647/"
@@ -657,12 +657,40 @@ def load_annotations(
     camera_line_counts: dict[int, int] = defaultdict(int)
     bytes_read = 0
     last_report = 0
+    # 大文件或网络文件用流式建索引（不载入完整 dict）
+    MB_500 = 500 * 1024 * 1024
+    use_lazy = is_remote_resource(jsonl_source) or file_size > MB_500
+    # 索引：{(camera_id, pts): byte_offset}
+    line_index: dict[tuple[int, int], int] = {}
 
-    print(f"正在读取 JSONL：{jsonl_source}")
+    print(f"正在读取 JSONL：{jsonl_source}" + (" (流式索引模式)" if use_lazy else ""))
 
     def check_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise JsonlLoadCancelled("JSONL 加载已取消")
+
+    def parse_meta(json_line: str) -> tuple[int | None, int | None]:
+        """轻量解析，仅提取 pts 和 camera_id，避免 json.loads 创建大对象。
+        无法用正则可靠提取相机号时返回 (None, None)，调用方会退化为完整解析。
+        """
+        import re
+        pts_match = re.search(r'"pts"\s*:\s*(\d+)', json_line)
+        if not pts_match:
+            return None, None
+        pts = int(pts_match.group(1))
+        # 提取 camera_id：与 camera_id_from_item 完全一致的两步逻辑
+        # 第一步：从 input_url 的文件名提取 xxx.m3u8 或 xxx.ts
+        url_match = re.search(r'"input_url"\s*:\s*"([^"]*)"', json_line)
+        cam = None
+        if url_match:
+            item_stub = {"input_url": url_match.group(1)}
+            cam = camera_id_from_item(item_stub)
+        # 第二步：从 result.cam_idx 提取
+        if cam is None:
+            cam_idx_match = re.search(r'"result"\s*:\s*\{[^}]*"cam_idx"\s*:\s*(\d+)', json_line)
+            if cam_idx_match:
+                cam = int(cam_idx_match.group(1)) + 101
+        return cam, pts
 
     def handle_line(line: str) -> None:
         nonlocal total_lines, bad_lines, player_count, ball_count
@@ -673,42 +701,65 @@ def load_annotations(
         line = line.strip()
         if not line:
             return
+        line_offset = bytes_read
 
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            bad_lines += 1
-            return
-        if not isinstance(item, dict):
-            bad_lines += 1
-            return
-
-        camera_id = camera_id_from_item(item)
-        pts = item.get("pts")
-        if camera_id is None or pts is None:
-            bad_lines += 1
-            return
+        if use_lazy:
+            cam, pts = parse_meta(line)
+            if cam is None or pts is None:
+                # 退化为完整解析
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    bad_lines += 1
+                    return
+                cam = camera_id_from_item(item)
+                pts = item.get("pts")
+                if cam is None or pts is None:
+                    bad_lines += 1
+                    return
+            camera_id = cam
+            pts_val = int(pts)
+        else:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                bad_lines += 1
+                return
+            if not isinstance(item, dict):
+                bad_lines += 1
+                return
+            cam = camera_id_from_item(item)
+            pts_val = item.get("pts")
+            if cam is None or pts_val is None:
+                bad_lines += 1
+                return
+            camera_id = cam
 
         total_lines += 1
         camera_annotation = store.cameras.setdefault(
             camera_id,
             CameraAnnotation(camera_id=camera_id),
         )
-        camera_annotation.items.append(item)
-        camera_annotation.pts_values.append(int(pts))
-        camera_annotation.pts_to_index[int(pts)] = len(camera_annotation.items) - 1
+        if use_lazy:
+            line_index[(camera_id, pts_val)] = line_offset
+            camera_annotation.items.append({"pts": pts_val, "_offset": line_offset})
+        else:
+            camera_annotation.items.append(item)
+        camera_annotation.pts_values.append(pts_val)
+        camera_annotation.pts_to_index[pts_val] = len(camera_annotation.items) - 1
         camera_line_counts[camera_id] += 1
 
-        result, _result_missing = result_dict_from_item(item)
-        players, _players_state = detection_list_from_result(result, "players")
-        balls, _balls_state = detection_list_from_result(result, "balls")
-        player_count += len(players)
-        ball_count += len(balls)
-        if not manual_ball_found:
-            for ball in balls:
-                if is_manual_ball(ball):
-                    manual_ball_found = True
-                    break
+        if not use_lazy:
+            result, _result_missing = result_dict_from_item(item)
+            players, _players_state = detection_list_from_result(result, "players")
+            balls, _balls_state = detection_list_from_result(result, "balls")
+            player_count += len(players)
+            ball_count += len(balls)
+            if not manual_ball_found:
+                for ball in balls:
+                    if is_manual_ball(ball):
+                        manual_ball_found = True
+                        break
 
         if progress_callback and total_lines - last_report >= 500:
             last_report = total_lines
@@ -722,14 +773,14 @@ def load_annotations(
                 file_size = int(content_length)
             for raw_line in response:
                 check_cancelled()
-                bytes_read += len(raw_line)
                 handle_line(raw_line.decode("utf-8"))
+                bytes_read += len(raw_line)
     else:
         with Path(jsonl_source).open("r", encoding="utf-8") as file:
             for line in file:
                 check_cancelled()
-                bytes_read += len(line.encode("utf-8"))
                 handle_line(line)
+                bytes_read += len(line.encode("utf-8"))
 
     check_cancelled()
     if progress_callback:
@@ -758,10 +809,12 @@ def load_annotations(
         "ball_count": ball_count,
         "has_manual_balls": manual_ball_found,
     }
+    if use_lazy:
+        store.summary["lazy_loaded"] = True
     print(f"JSONL 读取完成：{total_lines} 行，{len(store.cameras)} 路相机。")
     if progress_callback:
         progress_callback(100, total_lines, len(store.cameras))
-    return store
+    return store, line_index if use_lazy else {}
 
 
 def nearest_index_by_pts(annotation: CameraAnnotation, pts: int) -> int:
@@ -1482,6 +1535,11 @@ class OpenCvJsonlViewer:
         self.video_dir = video_dir
         self.frame_image_dir = frame_image_dir
         self.store = store
+        # 大 JSONL 按需加载：索引 + 缓存
+        self.jsonl_index: dict[tuple[int, int], int] = {}  # (camera_id, pts) -> byte_offset
+        self.jsonl_source_path: str = ""
+        self.jsonl_item_cache: dict[tuple[int, int], dict[str, Any]] = {}
+        self.jsonl_item_cache_max: int = 120
         self.current_camera = initial_camera
         self.current_index = 0
         self.current_raw_frame = None
@@ -2283,9 +2341,11 @@ class OpenCvJsonlViewer:
         self.update_annotation_buttons()
         self.update_label_option_state()
         self.update_json_panel_mode()
-        # 观看模式无 JSONL 时更新相机列表
+        # 观看模式无 JSONL 时切换到视频目录相机列表
         if self.is_view_work_mode() and not self.store.cameras:
             self._update_camera_choices_for_view_mode()
+        elif not self.is_view_work_mode() and self.store.cameras:
+            self.refresh_camera_choices()
         if render and self.store.cameras:
             self.render_current()
 
@@ -3364,6 +3424,7 @@ class OpenCvJsonlViewer:
             ),
         )
         item = annotation.items[json_index]
+        item = self._ensure_full_item(item)
         original_key = self.annotation_key_from_item(item, self.current_camera)
         if original_key is None:
             return candidates
@@ -3437,6 +3498,7 @@ class OpenCvJsonlViewer:
             ),
         )
         item = annotation.items[json_index]
+        item = self._ensure_full_item(item)
         key = self.annotation_key_from_item(item, self.current_camera)
         if key is None:
             return
@@ -3537,15 +3599,101 @@ class OpenCvJsonlViewer:
             raise KeyError(f"JSONL 中没有相机 {self.current_camera} 的数据")
         return annotation
 
+    def _ensure_full_item(self, item: dict) -> dict[str, Any]:
+        """将占位 item（有 _offset 字段）按需加载为完整 dict。"""
+        if "_offset" not in item:
+            return item
+        pts_val = int(item.get("pts"))
+        return self._load_jsonl_item(self.current_camera, pts_val)
+
+    def _load_jsonl_item(self, camera_id: int, pts: int) -> dict[str, Any]:
+        """按需从 JSONL 文件读取一行数据（支持本地和网络），带 LRU 缓存。"""
+        cache_key = (camera_id, pts)
+        cached = self.jsonl_item_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        # 从索引查找 byte offset（双键精确匹配）
+        offset = self.jsonl_index.get((camera_id, pts))
+        if offset is None:
+            # 退化为遍历 items
+            annotation = self.store.cameras.get(camera_id)
+            if annotation is None:
+                return {}
+            for item in annotation.items:
+                if int(item.get("pts")) == pts:
+                    self._add_to_jsonl_item_cache(cache_key, item)
+                    return item
+            return {}
+
+        line = self._read_jsonl_line(offset)
+        if line is None:
+            return {}
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            return {}
+        self._add_to_jsonl_item_cache(cache_key, item)
+        return item
+
+    def _read_jsonl_line(self, byte_offset: int) -> str | None:
+        """读取 JSONL 文件中指定偏移的一行。"""
+        source = self.jsonl_source_path
+        if not source:
+            return None
+        if is_remote_resource(source):
+            return self._read_jsonl_line_remote(source, byte_offset)
+        else:
+            return self._read_jsonl_line_local(source, byte_offset)
+
+    def _read_jsonl_line_local(self, path: str, byte_offset: int) -> str | None:
+        """本地文件：seek + readline。"""
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                fh.seek(byte_offset)
+                line = fh.readline()
+                return line.strip() if line else None
+        except Exception:
+            return None
+
+    def _read_jsonl_line_remote(self, url: str, byte_offset: int) -> str | None:
+        """网络文件：HTTP Range 请求。"""
+        try:
+            request = Request(
+                url,
+                headers={
+                    "User-Agent": "opencv-jsonl-viewer/1.0",
+                    "Range": f"bytes={byte_offset}-{byte_offset + 8191}",
+                },
+            )
+            with urlopen(request, timeout=30) as response:
+                data = response.read()
+                text = data.decode("utf-8", errors="replace")
+                newline = text.find("\n")
+                return text[:newline].strip() if newline >= 0 else text.strip()
+        except Exception:
+            return None
+
+    def _add_to_jsonl_item_cache(self, key: tuple[int, int], item: dict) -> None:
+        """写入缓存，超过上限时淘汰最旧条目。"""
+        self.jsonl_item_cache[key] = item
+        while len(self.jsonl_item_cache) > self.jsonl_item_cache_max:
+            oldest = next(iter(self.jsonl_item_cache))
+            del self.jsonl_item_cache[oldest]
+
     def refresh_camera_choices(self) -> None:
         cameras = [str(camera_id) for camera_id in sorted(self.store.cameras)]
         if self.camera_box is not None:
-            self.camera_box.configure(values=cameras)
+            self.camera_box.configure(values=cameras, state="readonly")
 
     def choose_media_dir(self) -> None:
         if self.is_video_mode():
             initial_value = resource_to_text(self.video_dir)
-            initialdir = self.video_dir if self.video_dir.is_dir() else PROJECT_DIR
+            if is_remote_resource(self.video_dir):
+                initialdir = PROJECT_DIR
+            else:
+                video_path = local_path_from_resource(self.video_dir)
+                initialdir = video_path if video_path.is_dir() else PROJECT_DIR
             dialog_title = "选择视频路径"
         else:
             initial_value = resource_to_text(self.frame_image_dir)
@@ -3734,7 +3882,7 @@ class OpenCvJsonlViewer:
 
         def worker() -> None:
             try:
-                new_store = load_annotations(
+                new_store, lazy_index = load_annotations(
                     jsonl_source,
                     progress_callback=progress_cb,
                     cancel_event=cancel_event,
@@ -3744,6 +3892,7 @@ class OpenCvJsonlViewer:
                         "kind": "done",
                         "token": token,
                         "store": new_store,
+                        "lazy_index": lazy_index,
                         "path": jsonl_source,
                         "preset_camera": preset_camera,
                         "error": None,
@@ -3834,6 +3983,14 @@ class OpenCvJsonlViewer:
         self.store = new_store
         self.current_jsonl_path = resource_to_text(jsonl_path)
         self.refresh_camera_choices()
+        lazy_index = result.get("lazy_index")
+        if lazy_index:
+            self.jsonl_index = lazy_index
+            self.jsonl_source_path = resource_to_text(jsonl_path)
+            self.jsonl_item_cache.clear()
+        else:
+            self.jsonl_index.clear()
+            self.jsonl_source_path = ""
 
         current_camera = self.current_camera
         if preset_camera is not None and preset_camera in self.store.cameras:
@@ -5669,6 +5826,7 @@ class OpenCvJsonlViewer:
             ),
         )
         item = annotation.items[json_index]
+        item = self._ensure_full_item(item)
         item_annotation_key = self.annotation_key_from_item(item, self.current_camera)
         deleted_ball_indices = (
             self.deleted_original_ball_indices.get(item_annotation_key, set())
