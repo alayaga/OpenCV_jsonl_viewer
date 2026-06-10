@@ -1336,8 +1336,9 @@ def draw_detections(
                 continue
 
             x1, y1, x2, y2 = bbox_rect
+            ball_color = (0, 0, 255) if safe_score(ball.get("score")) <= 0 else BALL_COLOR_BGR
             cv2.rectangle(
-                frame, (x1, y1), (x2, y2), BALL_COLOR_BGR, max(2, box_thickness + 1)
+                frame, (x1, y1), (x2, y2), ball_color, max(2, box_thickness + 1)
             )
             label = f"ball {score_text(ball, 'score')}"
             label_x, label_y = find_label_position(
@@ -1355,7 +1356,7 @@ def draw_detections(
                 frame,
                 (x1, y1, x2, y2),
                 rect,
-                BALL_COLOR_BGR,
+                ball_color,
                 max(1, label_thickness),
             )
             rect = draw_label(
@@ -1363,7 +1364,7 @@ def draw_detections(
                 label,
                 label_x,
                 label_y,
-                BALL_COLOR_BGR,
+                ball_color,
                 font_scale=label_scale,
                 thickness=label_thickness,
             )
