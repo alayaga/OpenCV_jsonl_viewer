@@ -59,7 +59,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
 
 # 输入视频目录：里面应包含 101.m3u8 ... 124.m3u8 或 101.ts ... 124.ts。
-VIDEO_DIR = PROJECT_DIR / "videos" / "match_1_clip"
+VIDEO_DIR = "https://sense-omni.tos-cn-shanghai.volces.com/hocky/rba/video/segment2/"
 
 # 2D pipeline 输出的 JSONL。
 JSONL_PATH = "https://sense-omni.tos-cn-shanghai.volces.com/hocky/lym/data_saved/0526/output/jsonl_without_players/20260526_164647/output_0_no_players.jsonl"
@@ -156,7 +156,7 @@ class PyAvVideoFrameReader:
 
     def __init__(
         self,
-        playlist_path: Path,
+        playlist_path: Any,
         annotation: CameraAnnotation,
         keyframe_index: VideoKeyframeIndex,
     ):
@@ -596,7 +596,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="播放 m3u8 并叠加 JSONL 检测结果")
     parser.add_argument(
         "--video-dir",
-        type=Path,
+        type=str,
         default=VIDEO_DIR,
         help=f"视频目录，仅视频模式需要，默认：{VIDEO_DIR}",
     )
@@ -783,7 +783,7 @@ def nearest_index_by_pts(annotation: CameraAnnotation, pts: int) -> int:
 
 
 def build_video_keyframe_index(
-    playlist_path: Path,
+    playlist_path: Any,
     annotation: CameraAnnotation,
 ) -> VideoKeyframeIndex:
     if av is None:
@@ -1523,6 +1523,17 @@ class OpenCvJsonlViewer:
         self.video_keyframe_indexes: dict[int, VideoKeyframeIndex] = {}
         self.video_readers: dict[int, PyAvVideoFrameReader] = {}
         self.video_frame_cache: dict[int, Any] = {}
+        # 观看模式直读视频（无 JSONL 时使用，PyAV 解码）
+        self.direct_video_container: Any | None = None
+        self.direct_video_stream: Any | None = None
+        self.direct_video_total_frames: int = 0
+        self.direct_video_initial_pts: int | None = None
+        self.direct_video_current_pts: int | None = None  # 当前帧的实际 PTS
+        self.direct_video_duration_pts: int = 0  # 视频总时长（PTS 单位）
+        self.direct_video_current_frame: int = -1
+        self.direct_video_decoded_frame: Any | None = None
+        # 观看模式扫描的本地图片帧列表（无 JSONL 时使用）
+        self.scanned_image_pts: dict[int, list[int]] = {}  # camera_id -> sorted pts list
         self.video_cache_start = 0
         self.video_cache_end = -1
         self.video_task_token = 0
@@ -2272,6 +2283,9 @@ class OpenCvJsonlViewer:
         self.update_annotation_buttons()
         self.update_label_option_state()
         self.update_json_panel_mode()
+        # 观看模式无 JSONL 时更新相机列表
+        if self.is_view_work_mode() and not self.store.cameras:
+            self._update_camera_choices_for_view_mode()
         if render and self.store.cameras:
             self.render_current()
 
@@ -3557,15 +3571,16 @@ class OpenCvJsonlViewer:
         current_pts = self.current_display_pts()
 
         if self.is_video_mode():
-            if is_remote_resource(selected_resource):
-                messagebox.showerror("暂不支持", "视频模式目前只支持本地视频目录")
-                return
             self.cancel_video_task()
             self.clear_video_cache()
             self.close_video_readers()
             self.video_keyframe_indexes.clear()
-            self.video_dir = local_path_from_resource(selected_resource).resolve()
-            self.status_var.set(f"已切换视频目录：{self.video_dir}")
+            self._close_video_direct()
+            if is_remote_resource(selected_resource):
+                self.video_dir = selected_resource
+            else:
+                self.video_dir = local_path_from_resource(selected_resource).resolve()
+            self.status_var.set(f"已切换视频路径：{self.video_dir}")
         else:
             self.frame_image_dir = selected_resource
             self.clear_image_cache()
@@ -3573,7 +3588,13 @@ class OpenCvJsonlViewer:
         self.update_image_prefetch_controls()
 
         if not self.store.cameras:
-            if messagebox.askyesno(
+            if self.is_view_work_mode():
+                # 观看模式：无需 JSONL，更新相机列表后直接打开
+                self._update_camera_choices_for_view_mode()
+                camera_id = self._prompt_camera_id()
+                if camera_id is not None:
+                    self.open_camera(camera_id)
+            elif messagebox.askyesno(
                 "选择 JSONL", "尚未加载 JSONL 数据，是否现在选择 JSONL 文件？"
             ):
                 self.choose_jsonl()
@@ -3646,7 +3667,25 @@ class OpenCvJsonlViewer:
 
         preset = PRESETS[choice - 1]
         self.frame_image_dir = preset["image"]
-        self.start_jsonl_load(preset["jsonl"], preset_camera=DEFAULT_CAMERA)
+
+        if self.is_view_work_mode():
+            # 观看模式：可选是否加载 JSONL
+            load_jsonl = messagebox.askyesno(
+                "加载 JSONL",
+                "是否同时加载 JSONL 检测数据？\n\n"
+                "选「是」：加载 JSONL（可显示检测框）\n"
+                "选「否」：只加载图片/视频（纯观看）",
+                parent=self.root,
+            )
+            if load_jsonl:
+                self.start_jsonl_load(preset["jsonl"], preset_camera=DEFAULT_CAMERA)
+            else:
+                self._update_camera_choices_for_view_mode()
+                camera_id = self._prompt_camera_id()
+                if camera_id is not None:
+                    self.open_camera(camera_id)
+        else:
+            self.start_jsonl_load(preset["jsonl"], preset_camera=DEFAULT_CAMERA)
 
     def update_jsonl_load_button_state(self) -> None:
         if self.cancel_jsonl_load_button is None:
@@ -4340,13 +4379,174 @@ class OpenCvJsonlViewer:
             reader.close()
 
     def resolve_video_path(self, camera_id: int) -> Path | None:
-        m3u8_path = self.video_dir / f"{camera_id}.m3u8"
+        base = Path(self.video_dir) if not isinstance(self.video_dir, Path) else self.video_dir
+        m3u8_path = base / f"{camera_id}.m3u8"
         if m3u8_path.is_file():
             return m3u8_path
-        ts_path = self.video_dir / f"{camera_id}.ts"
+        ts_path = base / f"{camera_id}.ts"
         if ts_path.is_file():
             return ts_path
         return None
+
+    def _resolve_video_resource(self, camera_id: int) -> Any | None:
+        """解析视频路径，支持本地和网络 URL。返回 Path 或 URL 字符串。"""
+        if is_remote_resource(self.video_dir):
+            # 网络路径：尝试 .m3u8 和 .ts
+            for ext in ("m3u8", "ts"):
+                resource = join_resource(self.video_dir, f"{camera_id}.{ext}")
+                return resource  # 无法预先检查是否存在，直接返回
+        return self.resolve_video_path(camera_id)
+
+    def _open_video_direct(self, camera_id: int) -> None:
+        """观看模式：用 PyAV 打开视频，不依赖 JSONL。支持 m3u8/HLS/HEVC。"""
+        if av is None:
+            self.status_var.set("缺少 PyAV 依赖，无法播放视频")
+            return
+
+        resource = self._resolve_video_resource(camera_id)
+        if resource is None:
+            return
+
+        url = resource_to_request_url(resource) if is_remote_resource(resource) else str(resource)
+        self._close_video_direct()
+
+        try:
+            container = av.open(url)
+            stream = container.streams.video[0]
+            try:
+                stream.thread_type = "AUTO"
+            except Exception:
+                pass
+        except Exception as exc:
+            self.status_var.set(f"PyAV 打开视频失败：{exc}")
+            return
+
+        self.direct_video_container = container
+        self.direct_video_stream = stream
+        self.direct_video_current_frame = -1
+        self.direct_video_decoded_frame = None
+
+        # 解码第一帧获取初始 PTS
+        self.direct_video_initial_pts = None
+        self.direct_video_current_pts = None
+        try:
+            for frame in container.decode(stream):
+                if frame.pts is not None:
+                    self.direct_video_initial_pts = int(frame.pts)
+                    self.direct_video_current_pts = int(frame.pts)
+                    self.direct_video_decoded_frame = frame.to_ndarray(format="bgr24")
+                    self.direct_video_current_frame = 0
+                break
+        except Exception:
+            pass
+
+        # 获取视频总时长（PTS 单位）
+        self.direct_video_duration_pts = 0
+        if stream.duration is not None and stream.duration > 0:
+            # stream.duration 是以 time_base 为单位的
+            self.direct_video_duration_pts = stream.duration
+        elif container.duration is not None and container.duration > 0:
+            # container.duration 是微秒，转换为 PTS 单位
+            if stream.time_base is not None:
+                self.direct_video_duration_pts = int(container.duration / 1_000_000 / float(stream.time_base))
+            else:
+                self.direct_video_duration_pts = container.duration
+
+        # 总帧数（用于参考，进度条用 PTS）
+        nb_frames = stream.frames
+        self.direct_video_total_frames = nb_frames if nb_frames and nb_frames > 0 else 999999
+
+    def _close_video_direct(self) -> None:
+        """释放观看模式的直读视频资源。"""
+        if self.direct_video_container is not None:
+            try:
+                self.direct_video_container.close()
+            except Exception:
+                pass
+            self.direct_video_container = None
+        self.direct_video_stream = None
+        self.direct_video_total_frames = 0
+        self.direct_video_initial_pts = None
+        self.direct_video_current_pts = None
+        self.direct_video_duration_pts = 0
+        self.direct_video_current_frame = -1
+        self.direct_video_decoded_frame = None
+
+    def _scan_video_dir_cameras(self) -> list[int]:
+        """扫描视频目录，返回可用的相机编号列表（本地目录）。"""
+        if is_remote_resource(self.video_dir):
+            # 网络目录：无法扫描，返回默认范围
+            return list(range(101, 125))
+        video_dir = local_path_from_resource(self.video_dir)
+        if not video_dir.is_dir():
+            return []
+        cameras = []
+        for f in sorted(video_dir.iterdir()):
+            stem = f.stem
+            if stem.isdigit() and f.suffix in (".m3u8", ".ts"):
+                cameras.append(int(stem))
+        return cameras
+
+    def _update_camera_choices_for_view_mode(self) -> None:
+        """观看模式无 JSONL 时，根据视频/图片目录更新相机下拉框。"""
+        if self.camera_box is None:
+            return
+        if self.is_video_mode():
+            cameras = self._scan_video_dir_cameras()
+        else:
+            # 图片模式：扫描图片目录
+            if is_remote_resource(self.frame_image_dir):
+                cameras = list(range(101, 125))  # 默认范围
+            else:
+                img_dir = local_path_from_resource(self.frame_image_dir)
+                cameras = sorted(int(d.name) for d in img_dir.iterdir() if d.is_dir() and d.name.isdigit()) if img_dir.is_dir() else []
+        if cameras:
+            self.camera_box.configure(values=[str(c) for c in cameras], state="normal")
+
+    def _has_direct_video(self) -> bool:
+        """是否处于观看模式直读视频状态。"""
+        return self.direct_video_container is not None
+
+    def _prompt_camera_id(self) -> int | None:
+        """弹窗让用户输入相机编号，返回 None 表示取消。"""
+        camera_str = simpledialog.askstring(
+            "输入相机编号",
+            "请输入相机编号（如 101、102 等）：",
+            initialvalue=str(self.current_camera),
+            parent=self.root,
+        )
+        if camera_str is None:
+            return None
+        try:
+            return int(camera_str.strip())
+        except ValueError:
+            messagebox.showerror("输入错误", "相机编号必须是整数")
+            return None
+
+    def _scan_local_image_dir(self, camera_id: int) -> bool:
+        """扫描本地图片目录，收集 PTS 文件列表。返回是否成功。"""
+        if is_remote_resource(self.frame_image_dir):
+            return False
+        camera_dir = local_path_from_resource(self.frame_image_dir) / str(camera_id)
+        if not camera_dir.is_dir():
+            return False
+        pts_list = []
+        for f in camera_dir.iterdir():
+            if f.suffix.lower() in (".jpg", ".jpeg", ".png") and f.stem.isdigit():
+                pts_list.append(int(f.stem))
+        pts_list.sort()
+        if not pts_list:
+            return False
+        self.scanned_image_pts[camera_id] = pts_list
+        return True
+
+    def _get_frame_count(self, camera_id: int) -> int:
+        """获取当前相机的帧总数（不依赖 JSONL）。"""
+        if self._has_direct_video():
+            return self.direct_video_total_frames
+        if camera_id in self.scanned_image_pts:
+            return len(self.scanned_image_pts[camera_id])
+        return 0
 
     def start_video_task(self, camera_id: int, frame_index: int) -> int:
         self.video_task_token += 1
@@ -4505,12 +4705,12 @@ class OpenCvJsonlViewer:
         if reader is not None:
             return reader
 
-        playlist_path = self.resolve_video_path(self.current_camera)
-        if playlist_path is None:
+        video_resource = self._resolve_video_resource(self.current_camera)
+        if video_resource is None:
             raise FileNotFoundError(f"找不到相机 {self.current_camera} 的视频文件")
         annotation = self.get_annotation()
         key_index = self.get_video_keyframe_index()
-        reader = PyAvVideoFrameReader(playlist_path, annotation, key_index)
+        reader = PyAvVideoFrameReader(video_resource, annotation, key_index)
         self.video_readers[self.current_camera] = reader
         return reader
 
@@ -4542,8 +4742,8 @@ class OpenCvJsonlViewer:
         annotation = self.get_annotation()
         frame_index = max(0, min(frame_index, len(annotation.items) - 1))
         camera_id = self.current_camera
-        playlist_path = self.resolve_video_path(camera_id)
-        if playlist_path is None:
+        video_resource = self._resolve_video_resource(camera_id)
+        if video_resource is None:
             messagebox.showerror(
                 "视频不存在", f"找不到相机 {camera_id} 的视频文件（.m3u8 或 .ts）"
             )
@@ -4571,7 +4771,7 @@ class OpenCvJsonlViewer:
                     if camera_id not in self.video_keyframe_indexes:
                         annotation_local = self.store.cameras[camera_id]
                         key_index = build_video_keyframe_index(
-                            playlist_path, annotation_local
+                            video_resource, annotation_local
                         )
                     else:
                         key_index = self.video_keyframe_indexes[camera_id]
@@ -4583,7 +4783,7 @@ class OpenCvJsonlViewer:
                     if reader is None:
                         annotation_local = self.store.cameras[camera_id]
                         reader = PyAvVideoFrameReader(
-                            playlist_path, annotation_local, key_index
+                            video_resource, annotation_local, key_index
                         )
                     else:
                         reader.keyframe_index = key_index
@@ -4648,8 +4848,8 @@ class OpenCvJsonlViewer:
             return
 
         camera_id = self.current_camera
-        playlist_path = self.resolve_video_path(camera_id)
-        if playlist_path is None:
+        video_resource = self._resolve_video_resource(camera_id)
+        if video_resource is None:
             return
 
         prefetch_after = self.video_prefetch_after
@@ -4668,7 +4868,7 @@ class OpenCvJsonlViewer:
                     if camera_id not in self.video_keyframe_indexes:
                         annotation_local = self.store.cameras[camera_id]
                         key_index = build_video_keyframe_index(
-                            playlist_path, annotation_local
+                            video_resource, annotation_local
                         )
                     else:
                         key_index = self.video_keyframe_indexes[camera_id]
@@ -4680,7 +4880,7 @@ class OpenCvJsonlViewer:
                     if reader is None:
                         annotation_local = self.store.cameras[camera_id]
                         reader = PyAvVideoFrameReader(
-                            playlist_path, annotation_local, key_index
+                            video_resource, annotation_local, key_index
                         )
                     else:
                         reader.keyframe_index = key_index
@@ -4726,12 +4926,39 @@ class OpenCvJsonlViewer:
         return annotation.pts_values[index]
 
     def update_progress_range(self) -> None:
+        # 直读视频模式：用 PTS 进度（1-10000）
+        if self._has_direct_video() and self.direct_video_duration_pts > 0:
+            self.progress_scale.configure(from_=1, to=10000)
+            return
+        total = self._get_frame_count(self.current_camera)
+        if total > 0:
+            self.progress_scale.configure(from_=1, to=total)
+            return
         annotation = self.get_annotation()
         upper = max(1, len(annotation.items))
         self.progress_scale.configure(from_=1, to=upper)
 
     def on_progress_drag(self, _value: str) -> None:
         if self.is_updating_progress:
+            return
+        # 直读视频 PTS 进度条
+        if self._has_direct_video() and self.direct_video_duration_pts > 0:
+            progress = float(self.progress_var.get())
+            target_pts = self.direct_video_initial_pts + int(
+                (progress - 1) / 10000 * self.direct_video_duration_pts
+            )
+            self.pts_var.set(str(target_pts))
+            return
+        total = self._get_frame_count(self.current_camera)
+        if total > 0:
+            frame_number = int(round(self.progress_var.get()))
+            frame_number = max(1, min(frame_number, total))
+            self.frame_var.set(str(frame_number))
+            pts_list = self.scanned_image_pts.get(self.current_camera, [])
+            if pts_list and frame_number - 1 < len(pts_list):
+                self.pts_var.set(str(pts_list[frame_number - 1]))
+            else:
+                self.pts_var.set("")
             return
         annotation = self.get_annotation()
         if not annotation.items:
@@ -4742,6 +4969,22 @@ class OpenCvJsonlViewer:
         self.pts_var.set(str(annotation.pts_values[frame_number - 1]))
 
     def apply_progress_seek(self) -> None:
+        # 直读视频模式：PTS 进度条（1-10000）
+        if self._has_direct_video() and self.direct_video_duration_pts > 0:
+            self.is_playing = False
+            progress = float(self.progress_var.get())
+            target_pts = self.direct_video_initial_pts + int(
+                (progress - 1) / 10000 * self.direct_video_duration_pts
+            )
+            self._seek_to_pts(target_pts)
+            return
+        total = self._get_frame_count(self.current_camera)
+        if total > 0:
+            self.is_playing = False
+            frame_number = int(round(self.progress_var.get()))
+            frame_number = max(1, min(frame_number, total))
+            self.seek_and_render(frame_number - 1)
+            return
         annotation = self.get_annotation()
         if not annotation.items:
             return
@@ -4770,6 +5013,12 @@ class OpenCvJsonlViewer:
             return
         self.is_playing = False
         self.cancel_video_task()
+
+        # 观看模式下无 JSONL 时，尝试直读视频/图片
+        if not self.store.cameras and self.is_view_work_mode():
+            self._open_camera_view_only(camera_id)
+            return
+
         if not self.store.cameras:
             self.status_var.set("尚未加载 JSONL 数据")
             return
@@ -4778,8 +5027,8 @@ class OpenCvJsonlViewer:
             return
 
         if self.is_video_mode():
-            playlist_path = self.resolve_video_path(camera_id)
-            if playlist_path is None:
+            video_resource = self._resolve_video_resource(camera_id)
+            if video_resource is None:
                 messagebox.showerror(
                     "视频不存在", f"找不到相机 {camera_id} 的视频文件（.m3u8 或 .ts）"
                 )
@@ -4807,6 +5056,188 @@ class OpenCvJsonlViewer:
         self.seek_and_render(frame_index)
         self.schedule_image_prefetch()
 
+    def _open_camera_view_only(self, camera_id: int) -> None:
+        """观看模式无 JSONL 时，直接打开视频或扫描图片目录。"""
+        self._close_video_direct()
+        self.scanned_image_pts.pop(camera_id, None)
+        self.current_camera = camera_id
+        self.camera_var.set(str(camera_id))
+        self.current_raw_frame = None
+        self.current_index = 0
+
+        if self.is_video_mode():
+            self._open_video_direct(camera_id)
+            if not self._has_direct_video():
+                self.status_var.set(
+                    f"无法打开视频：camera={camera_id}，请检查路径或加载 JSONL"
+                )
+                return
+            self._seek_and_render_direct(0)
+        else:
+            # 图片模式
+            if is_remote_resource(self.frame_image_dir):
+                self.status_var.set(
+                    "网络图片目录需要加载 JSONL 才能浏览（无法枚举远程文件）"
+                )
+                return
+            if not self._scan_local_image_dir(camera_id):
+                self.status_var.set(
+                    f"扫描图片目录失败：camera={camera_id}，请检查路径"
+                )
+                return
+            self._seek_and_render_direct(0)
+
+    def _seek_and_render_direct(self, frame_index: int) -> None:
+        """观看模式直读：读取并渲染指定帧（不依赖 JSONL）。"""
+        total = self._get_frame_count(self.current_camera)
+        if total <= 0:
+            return
+        frame_index = max(0, min(frame_index, total - 1))
+
+        if self._has_direct_video():
+            frame = self._read_pyav_frame(frame_index)
+            if frame is None:
+                self.status_var.set(f"读取视频帧失败：frame={frame_index + 1}")
+                return
+        else:
+            pts_list = self.scanned_image_pts.get(self.current_camera, [])
+            if frame_index >= len(pts_list):
+                return
+            pts = pts_list[frame_index]
+            camera_dir = local_path_from_resource(self.frame_image_dir) / str(self.current_camera)
+            image_path = camera_dir / f"{pts}.jpg"
+            if not image_path.is_file():
+                image_path = camera_dir / f"{pts}.jpeg"
+            if not image_path.is_file():
+                image_path = camera_dir / f"{pts}.png"
+            if not image_path.is_file():
+                self.status_var.set(f"找不到图片帧：{image_path}")
+                return
+            frame = cv2.imread(str(image_path))
+            if frame is None:
+                self.status_var.set(f"读取图片帧失败：{image_path}")
+                return
+
+        self.current_index = frame_index
+        self.current_raw_frame = frame
+        display_frame = cv2.resize(
+            frame, (self.display_width, self.display_height), interpolation=cv2.INTER_AREA
+        )
+        self.show_frame(display_frame)
+        self.frame_var.set(str(frame_index + 1))
+        # 显示实际 PTS 值
+        pts_list = self.scanned_image_pts.get(self.current_camera, [])
+        if pts_list and frame_index < len(pts_list):
+            self.pts_var.set(str(pts_list[frame_index]))
+        elif self.direct_video_current_pts is not None:
+            self.pts_var.set(str(self.direct_video_current_pts))
+        else:
+            self.pts_var.set("")
+        # 进度条：用 PTS 位置映射到 1-10000
+        self.is_updating_progress = True
+        try:
+            if (
+                self.direct_video_duration_pts > 0
+                and self.direct_video_initial_pts is not None
+                and self.direct_video_current_pts is not None
+            ):
+                progress = (
+                    (self.direct_video_current_pts - self.direct_video_initial_pts)
+                    / self.direct_video_duration_pts * 10000
+                )
+                self.progress_var.set(max(1, min(10000, progress + 1)))
+            else:
+                self.progress_var.set(frame_index + 1)
+        finally:
+            self.is_updating_progress = False
+        self.status_var.set(
+            f"观看模式 | 相机 {self.current_camera} | 帧 {frame_index + 1}/{total}"
+        )
+
+    def _seek_to_pts(self, target_pts: int) -> None:
+        """用 PyAV seek 到指定 PTS 并渲染该帧。"""
+        if self.direct_video_container is None or self.direct_video_stream is None:
+            return
+        try:
+            self.direct_video_container.seek(target_pts, stream=self.direct_video_stream)
+        except Exception:
+            return
+        self.direct_video_current_frame = -1
+        self.direct_video_decoded_frame = None
+        self.direct_video_current_pts = None
+
+        # 解码 seek 后的第一帧
+        try:
+            for frame in self.direct_video_container.decode(self.direct_video_stream):
+                self.direct_video_decoded_frame = frame.to_ndarray(format="bgr24")
+                if frame.pts is not None:
+                    self.direct_video_current_pts = int(frame.pts)
+                break
+        except Exception:
+            return
+
+        if self.direct_video_decoded_frame is None:
+            return
+
+        # 更新显示
+        total = self._get_frame_count(self.current_camera)
+        frame = self.direct_video_decoded_frame
+        self.current_raw_frame = frame
+        display_frame = cv2.resize(
+            frame, (self.display_width, self.display_height), interpolation=cv2.INTER_AREA
+        )
+        self.show_frame(display_frame)
+        # 显示 PTS
+        stream = self.direct_video_stream
+        if self.direct_video_current_pts is not None:
+            self.pts_var.set(str(self.direct_video_current_pts))
+        # 进度条
+        self.is_updating_progress = True
+        try:
+            if self.direct_video_duration_pts > 0 and self.direct_video_current_pts is not None:
+                progress = (
+                    (self.direct_video_current_pts - self.direct_video_initial_pts)
+                    / self.direct_video_duration_pts * 10000
+                )
+                self.progress_var.set(max(1, min(10000, progress + 1)))
+        finally:
+            self.is_updating_progress = False
+        self.status_var.set(
+            f"观看模式 | 相机 {self.current_camera} | PTS {self.direct_video_current_pts}"
+        )
+
+    def _read_pyav_frame(self, frame_index: int) -> Any | None:
+        """用 PyAV 读取指定帧号的视频帧。支持顺序解码和回退重置。"""
+        if self.direct_video_container is None or self.direct_video_stream is None:
+            return None
+
+        # 命中缓存
+        if frame_index == self.direct_video_current_frame and self.direct_video_decoded_frame is not None:
+            return self.direct_video_decoded_frame
+
+        # 需要回退到开头
+        if frame_index < self.direct_video_current_frame:
+            try:
+                self.direct_video_container.seek(0, stream=self.direct_video_stream)
+            except Exception:
+                return None
+            self.direct_video_current_frame = -1
+            self.direct_video_decoded_frame = None
+            self.direct_video_current_pts = None
+
+        # 顺序解码到目标帧
+        try:
+            for frame in self.direct_video_container.decode(self.direct_video_stream):
+                self.direct_video_current_frame += 1
+                self.direct_video_decoded_frame = frame.to_ndarray(format="bgr24")
+                if frame.pts is not None:
+                    self.direct_video_current_pts = int(frame.pts)
+                if self.direct_video_current_frame == frame_index:
+                    return self.direct_video_decoded_frame
+        except Exception:
+            return None
+        return None
+
     def is_video_mode(self) -> bool:
         return self.mode_var.get() == INPUT_MODE_VIDEO
 
@@ -4822,6 +5253,8 @@ class OpenCvJsonlViewer:
             return
         self.is_playing = False
         self.current_raw_frame = None
+        self._close_video_direct()
+        self.scanned_image_pts.clear()
         self.clear_video_cache()
         self.clear_image_cache()
         if not self.is_video_mode():
@@ -4876,6 +5309,17 @@ class OpenCvJsonlViewer:
             return
 
         next_index = self.current_index + 1
+
+        # 观看模式直读（无 JSONL）
+        total = self._get_frame_count(self.current_camera)
+        if total > 0 and not self.store.cameras:
+            if next_index >= total:
+                self.is_playing = False
+                return
+            self._seek_and_render_direct(next_index)
+            self.root.after(PLAY_INTERVAL_MS, self.play_tick)
+            return
+
         if self.is_network_image_mode():
             annotation = self.get_annotation()
             next_index = max(0, min(next_index, len(annotation.items) - 1))
@@ -4932,11 +5376,38 @@ class OpenCvJsonlViewer:
         except ValueError:
             messagebox.showerror("输入错误", "PTS 必须是整数")
             return
-        annotation = self.get_annotation()
-        target_index = nearest_index_by_pts(annotation, pts)
-        if not self.confirm_unsaved_annotation_navigation("切帧", "seek", target_index):
+
+        # 有 JSONL 时：用 JSONL 的 PTS→帧号映射
+        if self.store.cameras:
+            annotation = self.get_annotation()
+            target_index = nearest_index_by_pts(annotation, pts)
+            if not self.confirm_unsaved_annotation_navigation("切帧", "seek", target_index):
+                return
+            self.seek_and_render(target_index)
             return
-        self.seek_and_render(target_index)
+
+        # 无 JSONL：图片模式用扫描的 PTS 列表做二分查找
+        pts_list = self.scanned_image_pts.get(self.current_camera, [])
+        if pts_list:
+            import bisect
+            pos = bisect.bisect_left(pts_list, pts)
+            if pos >= len(pts_list):
+                pos = len(pts_list) - 1
+            elif pos > 0 and abs(pts_list[pos] - pts) > abs(pts_list[pos - 1] - pts):
+                pos = pos - 1
+            self.seek_and_render(pos)
+            return
+
+        # 无 JSONL：视频模式，用 PyAV seek 到目标 PTS
+        if self._has_direct_video() and self.direct_video_initial_pts is not None:
+            if pts < self.direct_video_initial_pts:
+                self.status_var.set(f"PTS {pts} 小于视频初始 PTS {self.direct_video_initial_pts}")
+                return
+            self._seek_to_pts(pts)
+            return
+
+        # 无 JSONL、无初始 PTS：PTS 当作帧号使用
+        self.seek_and_render(pts)
 
     def apply_display_settings(self) -> None:
         try:
@@ -5060,6 +5531,11 @@ class OpenCvJsonlViewer:
         self.seek_and_render(target_index)
 
     def seek_and_render(self, frame_index: int) -> None:
+        # 观看模式直读（无 JSONL）
+        if self._has_direct_video() or self.scanned_image_pts.get(self.current_camera):
+            self._seek_and_render_direct(frame_index)
+            return
+
         if (
             self.annotation_mode_enabled
             and self.annotation_dirty
@@ -5581,6 +6057,7 @@ class OpenCvJsonlViewer:
         self.cancel_image_prefetch_task()
         self.cancel_video_task()
         self.close_video_readers()
+        self._close_video_direct()
         self.root.destroy()
 
 
@@ -5598,7 +6075,7 @@ def main() -> None:
         args = parse_args()
         require_dependencies()
 
-        video_dir = args.video_dir.expanduser().resolve()
+        video_dir = normalize_local_or_remote_resource(args.video_dir)
         frame_image_dir = normalize_local_or_remote_resource(args.frame_image_dir)
 
         store = AnnotationStore()
